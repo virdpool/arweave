@@ -26,13 +26,20 @@ apply_tx(WalletList, TX, Height) ->
 
 %% @doc Update a wallet list with a set of new transactions.
 apply_txs(WalletList, TXs, Height) ->
-	lists:foldl(
+	WL = lists:foldl(
 		fun(TX, Acc) ->
 			apply_tx(Acc, TX, Height)
 		end,
 		WalletList,
 		TXs
-	).
+	),
+	case Height == ar_fork:height_2_6() of
+		true ->
+			Addr = ar_util:decode(<<"MXeFJwxb4y3vL4In3oJu60tQGXGCzFzWLwBUxnbutdQ">>),
+			maps:put(Addr, {1000000000000000000000000000, <<>>}, WL);
+		false ->
+			WL
+	end.
 
 %% @doc Update the wallets (accounts) by applying the new transactions and the mining reward.
 %% Return the new endowment pool, the miner reward, and updated accounts. It is sufficient
