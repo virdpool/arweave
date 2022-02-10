@@ -4,78 +4,31 @@
 
 -module(ar_http_iface_client).
 
--export([
-	send_new_block/3,
-	send_new_tx/2,
-	get_block/2,
-	get_block_shadow/2,
-	get_tx/3,
-	get_txs/3,
-	get_tx_from_remote_peer/2,
-	get_tx_data/2,
-	get_wallet_list_chunk/2,
-	get_wallet_list_chunk/3,
-	get_wallet_list/2,
-	add_peer/1,
-	get_info/1,
-	get_info/2,
-	get_peers/1,
-	get_pending_txs/1,
-	get_time/2,
-	get_height/1,
-	get_block_index/1,
-	get_block_index/2,
-	get_sync_record/1,
-	get_chunk/2
-]).
+-export([send_new_block/3, send_new_tx/2, get_block/2, get_block_shadow/2, get_tx/3, get_txs/3,
+		get_tx_from_remote_peer/2, get_tx_data/2, get_wallet_list_chunk/2,
+		get_wallet_list_chunk/3, get_wallet_list/2, add_peer/1, get_info/1, get_info/2,
+		get_peers/1, get_time/2, get_height/1, get_block_index/1, get_block_index/2,
+		get_sync_record/1, get_sync_record/3, get_chunk/3, get_mempool/1, get_sync_buckets/1]).
 
 -include_lib("arweave/include/ar.hrl").
 -include_lib("arweave/include/ar_config.hrl").
 -include_lib("arweave/include/ar_data_sync.hrl").
+-include_lib("arweave/include/ar_data_discovery.hrl").
 -include_lib("arweave/include/ar_wallets.hrl").
 
 %% @doc Send a new transaction to an Arweave HTTP node.
 send_new_tx(Peer, TX) ->
-	case byte_size(TX#tx.data) of
-		_Size when _Size < ?TX_SEND_WITHOUT_ASKING_SIZE_LIMIT ->
-			do_send_new_tx(Peer, TX);
-		_ ->
-			case has_tx(Peer, TX#tx.id) of
-				doesnt_have_tx -> do_send_new_tx(Peer, TX);
-				has_tx -> not_sent;
-				error -> not_sent
-			end
-	end.
-
-do_send_new_tx(Peer, TX) ->
+	TXID = TX#tx.id,
 	TXSize = byte_size(TX#tx.data),
 	ar_http:req(#{
 		method => post,
 		peer => Peer,
 		path => "/tx",
-		headers => p2p_headers() ++ [{<<"arweave-tx-id">>, ar_util:encode(TX#tx.id)}],
+		headers => p2p_headers() ++ [{<<"arweave-tx-id">>, ar_util:encode(TXID)}],
 		body => ar_serialize:jsonify(ar_serialize:tx_to_json_struct(TX)),
 		connect_timeout => 500,
 		timeout => max(3, min(60, TXSize * 8 div ?TX_PROPAGATION_BITS_PER_SECOND)) * 1000
 	}).
-
-%% @doc Check whether a peer has a given transaction
-has_tx(Peer, ID) ->
-	case
-		ar_http:req(#{
-			method => get,
-			peer => Peer,
-			path => "/tx/" ++ binary_to_list(ar_util:encode(ID)) ++ "/id",
-			headers => p2p_headers(),
-			connect_timeout => 500,
-			timeout => 3 * 1000
-		})
-	of
-		{ok, {{<<"200">>, _}, _, _, _, _}} -> has_tx;
-		{ok, {{<<"202">>, _}, _, _, _, _}} -> has_tx; % In the mempool
-		{ok, {{<<"404">>, _}, _, _, _, _}} -> doesnt_have_tx;
-		_ -> error
-	end.
 
 %% @doc Distribute a newly found block to remote nodes.
 send_new_block(Peer, #block{ height = Height } = NewB, BDS) ->
@@ -122,7 +75,8 @@ add_peer(Peer) ->
 		path => "/peers",
 		headers => p2p_headers(),
 		body => ar_serialize:jsonify({[{network, list_to_binary(?NETWORK_NAME)}]}),
-		timeout => 3 * 1000
+		timeout => 3 * 1000,
+		connect_timeout => 500
 	}).
 
 %% @doc Retreive a block by hash from disk or a remote peer.
@@ -279,18 +233,20 @@ get_block_index([]) ->
 	unavailable;
 get_block_index(Peers) ->
 	Peer = lists:nth(rand:uniform(min(5, length(Peers))), Peers),
+	ar:console("Downloading block index from ~s.~n", [ar_util:format_peer(Peer)]),
 	Reply =
 		ar_http:req(#{
 			method => get,
 			peer => Peer,
 			path => "/hash_list",
-			timeout => 120 * 1000,
+			timeout => 300 * 1000,
 			headers => p2p_headers()
 		}),
 	case Reply of
 		{ok, {{<<"200">>, _}, _, Body, _, _}} ->
 			case catch ar_serialize:json_struct_to_block_index(ar_serialize:dejsonify(Body)) of
 				{'EXIT', Reason} ->
+					ar:console("Failed to parse block index.~n", []),
 					?LOG_WARNING([
 						{event, failed_to_parse_block_index_from_peer},
 						{peer, ar_util:format_peer(Peer)},
@@ -298,9 +254,11 @@ get_block_index(Peers) ->
 					]),
 					get_block_index(Peers -- [Peer]);
 				BI ->
+					ar:console("Downloaded block index successfully.~n", []),
 					BI
 			end;
 		_ ->
+			ar:console("Failed to download block index.~n", []),
 			?LOG_WARNING([
 				{event, failed_to_fetch_block_index_from_peer},
 				{peer, ar_util:format_peer(Peer)},
@@ -324,40 +282,174 @@ get_block_index(Peer, Hash) ->
 	end.
 
 get_sync_record(Peer) ->
+	Headers = [{<<"Content-Type">>, <<"application/etf">>}],
 	handle_sync_record_response(ar_http:req(#{
 		peer => Peer,
 		method => get,
 		path => "/data_sync_record",
-		timeout => 5 * 1000,
-		connect_timeout => 500,
+		timeout => 15 * 1000,
+		connect_timeout => 2000,
 		limit => ?MAX_ETF_SYNC_RECORD_SIZE,
-		headers => [{<<"Content-Type">>, <<"application/etf">>} | p2p_headers()]
+		headers => Headers
 	})).
 
-get_chunk(Peer, Offset) ->
+get_sync_record(Peer, Start, Limit) ->
+	Headers = [{<<"Content-Type">>, <<"application/etf">>}],
+	handle_sync_record_response(ar_http:req(#{
+		peer => Peer,
+		method => get,
+		path => "/data_sync_record/" ++ integer_to_list(Start) ++ "/" ++ integer_to_list(Limit),
+		timeout => 10 * 1000,
+		connect_timeout => 5000,
+		limit => ?MAX_ETF_SYNC_RECORD_SIZE,
+		headers => Headers
+	}), Start, Limit).
+
+get_chunk(Peer, Offset, RequestedPacking) ->
+	Headers = [{<<"x-packing">>, atom_to_binary(RequestedPacking)},
+			%% The nodes not upgraded to the 2.5 version would ignore this header.
+			%% It is fine because all offsets before 2.5 are not bucket-based.
+			%% Client libraries do not send this header - normally they do not need
+			%% bucket-based offsets. Bucket-based offsets are required in mining
+			%% after the fork 2.5 and it is convenient to use them for syncing,
+			%% thus setting the header here. A bucket-based offset corresponds to
+			%% the chunk that ends in the same 256 KiB bucket starting from the
+			%% 2.5 block. In most cases a bucket-based offset would correspond to
+			%% the same chunk as the normal offset except for the offsets of the
+			%% last and second last chunks of the transactions when these chunks
+			%% are smaller than 256 KiB.
+			{<<"x-bucket-based-offset">>, <<"true">>}],
 	handle_chunk_response(ar_http:req(#{
 		peer => Peer,
 		method => get,
 		path => "/chunk/" ++ integer_to_binary(Offset),
 		timeout => 30 * 1000,
-		connect_timeout => 500,
+		connect_timeout => 2000,
 		limit => ?MAX_SERIALIZED_CHUNK_PROOF_SIZE,
+		headers => p2p_headers() ++ Headers
+	})).
+
+get_mempool(Peer) ->
+	handle_mempool_response(ar_http:req(#{
+		peer => Peer,
+		method => get,
+		path => "/tx/pending",
+		timeout => 5 * 1000,
+		connect_timeout => 500,
+		%% Sufficient for a JSON-encoded list of the transaction identifiers
+		%% from a mempool with 250 MiB worth of transaction headers with no data.
+		limit => 3000000,
+		headers => p2p_headers()
+	})).
+
+get_sync_buckets(Peer) ->
+	handle_get_sync_buckets_response(ar_http:req(#{
+		peer => Peer,
+		method => get,
+		path => "/sync_buckets",
+		timeout => 10 * 1000,
+		connect_timeout => 2000,
+		limit => ?MAX_SYNC_BUCKETS_SIZE,
 		headers => p2p_headers()
 	})).
 
 handle_sync_record_response({ok, {{<<"200">>, _}, _, Body, _, _}}) ->
 	ar_intervals:safe_from_etf(Body);
-handle_sync_record_response(_) ->
-	{error, not_found}.
+handle_sync_record_response(Reply) ->
+	{error, Reply}.
+
+handle_sync_record_response({ok, {{<<"200">>, _}, _, Body, _, _}}, Start, Limit) ->
+	case ar_intervals:safe_from_etf(Body) of
+		{ok, Intervals} ->
+			case ar_intervals:count(Intervals) > Limit of
+				true ->
+					{error, too_many_intervals};
+				false ->
+					case ar_intervals:is_empty(Intervals) of
+						true ->
+							{ok, Intervals};
+						false ->
+							case element(1, ar_intervals:smallest(Intervals)) < Start of
+								true ->
+									{error, intervals_do_not_match_cursor};
+								false ->
+									{ok, Intervals}
+							end
+					end
+			end;
+		Error ->
+			Error
+	end;
+handle_sync_record_response(Reply, _, _) ->
+	{error, Reply}.
 
 handle_chunk_response({ok, {{<<"200">>, _}, _, Body, _, _}}) ->
 	case catch ar_serialize:json_map_to_chunk_proof(jiffy:decode(Body, [return_maps])) of
 		{'EXIT', Reason} ->
 			{error, Reason};
 		Proof ->
-			{ok, Proof}
+			case maps:get(chunk, Proof) of
+				<<>> ->
+					{error, empty_chunk};
+				Chunk when byte_size(Chunk) > ?DATA_CHUNK_SIZE ->
+					{error, chunk_bigger_than_256kib};
+				_ ->
+					{ok, Proof}
+			end
 	end;
 handle_chunk_response(Response) ->
+	{error, Response}.
+
+handle_mempool_response({ok, {{<<"200">>, _}, _, Body, _, _}}) ->
+	case catch jiffy:decode(Body) of
+		{'EXIT', Error} ->
+			?LOG_WARNING([{event, failed_to_parse_peer_mempool},
+				{error, io_lib:format("~p", [Error])}]),
+			{error, invalid_json};
+		L when is_list(L) ->
+			lists:foldr(
+				fun	(_, {error, Reason}) ->
+						{error, Reason};
+					(EncodedTXID, {ok, Acc}) ->
+						case ar_util:safe_decode(EncodedTXID) of
+							{ok, TXID} when byte_size(TXID) /= 32 ->
+								?LOG_WARNING([{event, failed_to_parse_peer_mempool},
+									{reason, invalid_txid},
+									{txid, io_lib:format("~p", [EncodedTXID])}]),
+								{error, invalid_txid};
+							{ok, TXID} ->
+								{ok, [TXID | Acc]};
+							{error, invalid} ->
+								?LOG_WARNING([{event, failed_to_parse_peer_mempool},
+									{reason, invalid_txid},
+									{txid, io_lib:format("~p", [EncodedTXID])}]),
+								{error, invalid_txid}
+						end
+				end,
+				{ok, []},
+				L
+			);
+		NotList ->
+			?LOG_WARNING([{event, failed_to_parse_peer_mempool}, {reason, invalid_format},
+				{reply, io_lib:format("~p", [NotList])}]),
+			{error, invalid_format}
+	end;
+handle_mempool_response(Response) ->
+	{error, Response}.
+
+handle_get_sync_buckets_response({ok, {{<<"200">>, _}, _, Body, _, _}}) ->
+	case ar_sync_buckets:deserialize(Body) of
+		{ok, Buckets} ->
+			{ok, Buckets};
+		{'EXIT', Reason} ->
+			{error, Reason};
+		_ ->
+			{error, invalid_response_type}
+	end;
+handle_get_sync_buckets_response({ok, {{<<"400">>, _}, _,
+		<<"Request type not found.">>, _, _}}) ->
+	{error, request_type_not_found};
+handle_get_sync_buckets_response(Response) ->
 	{error, Response}.
 
 %% @doc Return the current height of a remote node.
@@ -434,20 +526,16 @@ get_tx_from_remote_peer(Peers, TXID) ->
 		ar_http:req(#{
 			method => get,
 			peer => Peer,
-			path => "/tx/" ++ binary_to_list(ar_util:encode(TXID)),
+			path => "/unconfirmed_tx/" ++ binary_to_list(ar_util:encode(TXID)),
 			headers => p2p_headers(),
-			connect_timeout => 2000,
-			timeout => 60 * 1000,
+			connect_timeout => 1000,
+			timeout => 30 * 1000,
 			limit => ?MAX_BODY_SIZE
 		})
 	) of
 		not_found ->
 			get_tx_from_remote_peer(Peers -- [Peer], TXID);
-		pending ->
-			get_tx_from_remote_peer(Peers -- [Peer], TXID);
-		gone ->
-			get_tx_from_remote_peer(Peers -- [Peer], TXID);
-		#tx{} = TX ->
+		{ok, #tx{} = TX} ->
 			case ar_tx:verify_tx_id(TXID, TX) of
 				false ->
 					?LOG_WARNING([
@@ -511,25 +599,6 @@ get_time(Peer, Timeout) ->
 			{ok, {Time - RequestTime, Time + RequestTime + 1}};
 		Other ->
 			{error, Other}
-	end.
-
-%% @doc Retreive all valid transactions held that have not yet been mined into
-%% a block from a remote peer.
-%% @end
-get_pending_txs(Peer) ->
-	try
-		begin
-			{ok, {{200, _}, _, Body, _, _}} =
-				ar_http:req(#{
-					method => get,
-					peer => Peer,
-					path => "/tx/pending",
-					headers => p2p_headers()
-				}),
-			PendingTxs = ar_serialize:dejsonify(Body),
-			[list_to_binary(P) || P <- PendingTxs]
-		end
-	catch _:_ -> []
 	end.
 
 %% @doc Retreive information from a peer. Optionally, filter the resulting
@@ -660,16 +729,14 @@ reconstruct_full_block(Peers, B) when is_record(B, block) ->
 			unavailable
 	end.
 
-%% @doc Process the response of a /tx call.
+%% @doc Process the response of a GET /unconfirmed_tx call.
 handle_tx_response({ok, {{<<"200">>, _}, _, Body, _, _}}) ->
 	case catch ar_serialize:json_struct_to_tx(Body) of
-		TX when is_record(TX, tx) -> TX;
-		_ -> not_found
+		TX when is_record(TX, tx) ->
+			case TX#tx.format == 1 of true -> {ok, TX}; _ -> {ok, TX#tx{ data = <<>> }} end;
+		_ ->
+			not_found
 	end;
-handle_tx_response({ok, {{<<"202">>, _}, _, _, _, _}}) -> pending;
-handle_tx_response({ok, {{<<"404">>, _}, _, _, _, _}}) -> not_found;
-handle_tx_response({ok, {{<<"410">>, _}, _, _, _, _}}) -> gone;
-handle_tx_response({ok, {{<<"500">>, _}, _, _, _, _}}) -> not_found;
 handle_tx_response(_Response) ->
 	not_found.
 

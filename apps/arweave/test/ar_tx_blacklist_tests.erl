@@ -10,7 +10,7 @@
 -import(ar_test_node, [
 	slave_start/1, start/3, connect_to_slave/0,
 	get_tx_anchor/1,
-	sign_tx/2,
+	sign_tx/2, sign_v1_tx/2, random_v1_data/1,
 	slave_call/3,
 	assert_post_tx_to_slave/1, assert_post_tx_to_master/1,
 	slave_mine/0,
@@ -50,6 +50,7 @@ test_uses_blacklists() ->
 		TXs,
 		GoodTXIDs,
 		BadTXIDs,
+		V1TX,
 		GoodOffsets,
 		BadOffsets,
 		DataTrees
@@ -71,9 +72,16 @@ test_uses_blacklists() ->
 			]
 		}),
 	connect_to_slave(),
+	BadV1TXIDs = [V1TX#tx.id],
 	lists:foreach(
 		fun({TX, Height}) ->
 			assert_post_tx_to_slave(TX),
+			case Height == length(TXs) of
+				true ->
+					assert_post_tx_to_slave(V1TX);
+				_ ->
+					ok
+			end,
 			slave_mine(),
 			upload_data([TX], GoodTXIDs, DataTrees),
 			wait_until_height(Height)
@@ -81,7 +89,8 @@ test_uses_blacklists() ->
 		lists:zip(TXs, lists:seq(1, length(TXs)))
 	),
 	assert_present_txs(GoodTXIDs),
-	assert_removed_txs(BadTXIDs),
+	assert_present_txs(BadTXIDs), % V2 headers must not be removed.
+	assert_removed_txs(BadV1TXIDs),
 	assert_present_offsets(GoodOffsets),
 	assert_removed_offsets(BadOffsets),
 	assert_does_not_accept_offsets(BadOffsets),
@@ -97,23 +106,18 @@ test_uses_blacklists() ->
 	%% Expect the transaction data to be resynced.
 	assert_present_offsets(RestoredOffsets),
 	%% Expect the freshly blacklisted transaction to be erased.
-	assert_removed_txs([hd(GoodTXIDs)]),
+	assert_present_txs([hd(GoodTXIDs)]), % V2 headers must not be removed.
 	assert_removed_offsets([hd(GoodOffsets)]),
 	assert_does_not_accept_offsets([hd(GoodOffsets)]),
 	%% Expect the previously blacklisted transactions to stay blacklisted.
-	assert_removed_txs(BadTXIDs2),
+	assert_present_txs(BadTXIDs2), % V2 headers must not be removed.
+	assert_removed_txs(BadV1TXIDs),
 	assert_removed_offsets(BadOffsets2),
 	assert_does_not_accept_offsets(BadOffsets2),
 	%% Blacklist the last transaction. Fork the weave. Assert the blacklisted offsets are moved.
 	disconnect_from_slave(),
-	TX = sign_tx(
-		Wallet,
-		#{
-			format => 1,
-			data => crypto:strong_rand_bytes(102400),
-			last_tx => get_tx_anchor(slave)
-		}
-	),
+	TX = sign_tx(Wallet, #{ data => crypto:strong_rand_bytes(?DATA_CHUNK_SIZE),
+			last_tx => get_tx_anchor(slave) }),
 	assert_post_tx_to_master(TX),
 	ar_node:mine(),
 	[{_, WeaveSize, _} | _] = wait_until_height(length(TXs) + 1),
@@ -121,14 +125,8 @@ test_uses_blacklists() ->
 	ok = file:write_file(lists:nth(3, BlacklistFiles), ar_util:encode(TX#tx.id)),
 	assert_removed_offsets([[WeaveSize]]),
 	connect_to_slave(),
-	TX2 = sign_tx(
-		Wallet,
-		#{
-			format => 1,
-			data => crypto:strong_rand_bytes(204800),
-			last_tx => get_tx_anchor(slave)
-		}
-	),
+	TX2 = sign_v1_tx(Wallet, #{ data => random_v1_data(2 * ?DATA_CHUNK_SIZE),
+			last_tx => get_tx_anchor(slave) }),
 	assert_post_tx_to_slave(TX2),
 	slave_mine(),
 	assert_slave_wait_until_height(length(TXs) + 1),
@@ -145,7 +143,9 @@ setup() ->
 	{TXs, DataTrees} = create_txs(Wallet),
 	TXIDs = [TX#tx.id || TX <- TXs],
 	BadTXIDs = [lists:nth(1, TXIDs), lists:nth(3, TXIDs)],
-	BlacklistFiles = create_files(BadTXIDs),
+	V1TX = sign_v1_tx(Wallet, #{ data => random_v1_data(3 * ?DATA_CHUNK_SIZE),
+			last_tx => get_tx_anchor(slave) }),
+	BlacklistFiles = create_files([V1TX#tx.id | BadTXIDs]),
 	BadTXIDs2 = [lists:nth(5, TXIDs), lists:nth(7, TXIDs)],
 	Routes = [{"/[...]", ar_tx_blacklist_tests, BadTXIDs2}],
 	{ok, _PID} =
@@ -164,7 +164,7 @@ setup() ->
 				%% Every TX in this test consists of 10 chunks.
 				%% Only every second chunk is uploaded in this test
 				%% for (originally) blacklisted transactions.
-				[TXOffset - 102400 * I || I <- lists:seq(0, 9, 2)]
+				[TXOffset - ?DATA_CHUNK_SIZE * I || I <- lists:seq(0, 9, 2)]
 			end,
 			BadOffsets
 		),
@@ -176,7 +176,7 @@ setup() ->
 		lists:map(
 			fun(TXOffset) ->
 				%% Every TX in this test consists of 10 chunks.
-				[TXOffset - 102400 * I || I <- lists:seq(0, 9)]
+				[TXOffset - ?DATA_CHUNK_SIZE * I || I <- lists:seq(0, 9)]
 			end,
 			GoodOffsets
 		),
@@ -187,6 +187,7 @@ setup() ->
 		TXs,
 		GoodTXIDs,
 		BadTXIDs ++ BadTXIDs2,
+		V1TX,
 		GoodOffsets2,
 		BadOffsets2,
 		DataTrees
@@ -204,22 +205,16 @@ create_txs(Wallet) ->
 			(_, {TXs, DataTrees}) ->
 				Chunks =
 					lists:sublist(
-						ar_tx:chunk_binary(102400, crypto:strong_rand_bytes(1024000)),
+						ar_tx:chunk_binary(?DATA_CHUNK_SIZE,
+								crypto:strong_rand_bytes(10 * ?DATA_CHUNK_SIZE)),
 						10
 					), % Exclude empty chunk created by chunk_to_binary.
 				SizedChunkIDs = ar_tx:sized_chunks_to_sized_chunk_ids(
 					ar_tx:chunks_to_size_tagged_chunks(Chunks)
 				),
 				{DataRoot, DataTree} = ar_merkle:generate_tree(SizedChunkIDs),
-				TX = sign_tx(
-					Wallet,
-					#{
-						format => 2,
-						data_root => DataRoot,
-						data_size => 1024000,
-						last_tx => get_tx_anchor(slave)
-					}
-				),
+				TX = sign_tx(Wallet, #{ format => 2, data_root => DataRoot,
+						data_size => 10 * ?DATA_CHUNK_SIZE, last_tx => get_tx_anchor(slave) }),
 				{[TX | TXs], maps:put(TX#tx.id, {DataTree, Chunks}, DataTrees)}
 		end,
 		{[], #{}},
@@ -230,11 +225,11 @@ create_files(BadTXIDs) ->
 	Files = [
 		{random_filename(), <<>>},
 		{random_filename(), <<"bad base64url ">>},
-		{random_filename(), ar_util:encode(hd(BadTXIDs))},
+		{random_filename(), ar_util:encode(lists:nth(2, BadTXIDs))},
 		{random_filename(),
 			list_to_binary(
 				io_lib:format(
-					"~s\nbad base64url \n~s\n",
+					"~s\nbad base64url \n~s\n~s\n",
 					lists:map(fun ar_util:encode/1, BadTXIDs)
 				)
 			)}
@@ -274,13 +269,15 @@ upload_data(TXs, GoodTXIDs, DataTrees) ->
 				data_size = DataSize
 			} = TX,
 			{DataTree, Chunks} = maps:get(TXID, DataTrees),
-			ChunkOffsets = lists:zip(Chunks, lists:seq(102400, 1024000, 102400)),
+			ChunkOffsets = lists:zip(Chunks,
+					lists:seq(?DATA_CHUNK_SIZE, 10 * ?DATA_CHUNK_SIZE, ?DATA_CHUNK_SIZE)),
 			UploadChunks =
 				case lists:member(TXID, GoodTXIDs) of
 					true ->
 						ChunkOffsets;
 					false ->
-						[{Chunk, O} || {Chunk, O} <- ChunkOffsets, O rem 204800 == 0]
+						[{Chunk, O} || {Chunk, O} <- ChunkOffsets,
+							O rem (2 * ?DATA_CHUNK_SIZE) == 0]
 				end,
 			lists:foreach(
 				fun({Chunk, Offset}) ->
@@ -312,9 +309,17 @@ assert_present_txs(GoodTXIDs) ->
 		end,
 		500,
 		10000
+	),
+	lists:foreach(
+		fun(TXID) ->
+			?assertMatch({ok, {_, _}}, ar_storage:get_tx_confirmation_data(TXID))
+		end,
+		GoodTXIDs
 	).
 
 assert_removed_txs(BadTXIDs) ->
+	?debugFmt("Waiting until these txids are removed: ~p.",
+			[[ar_util:encode(TXID) || TXID <- BadTXIDs]]),
 	true = ar_util:do_until(
 		fun() ->
 			lists:all(
@@ -326,6 +331,13 @@ assert_removed_txs(BadTXIDs) ->
 		end,
 		500,
 		10000
+	),
+	%% We have to keep the confirmation data even for blacklisted transactions.
+	lists:foreach(
+		fun(TXID) ->
+			?assertMatch({ok, {_, _}}, ar_storage:get_tx_confirmation_data(TXID))
+		end,
+		BadTXIDs
 	).
 
 assert_present_offsets(GoodOffsets) ->
@@ -344,7 +356,7 @@ assert_present_offsets(GoodOffsets) ->
 			)
 		end,
 		500,
-		60000
+		120000
 	).
 
 assert_removed_offsets(BadOffsets) ->
@@ -382,7 +394,7 @@ assert_does_not_accept_offsets(BadOffsets) ->
 							Proof2 = Proof#{
 								offset => RelativeOffset - 1,
 								data_root => DataRoot,
-								data_size => 1024000
+								data_size => 10 * ?DATA_CHUNK_SIZE
 							},
 							EncodedProof2 = encode_chunk(Proof2),
 							%% The node returns 200 but does not store the chunk.

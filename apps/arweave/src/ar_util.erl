@@ -1,16 +1,11 @@
 -module(ar_util).
 
--export([
-	pick_random/1, pick_random/2,
-	encode/1, decode/1, safe_decode/1,
-	parse_peer/1, parse_port/1, safe_parse_peer/1, format_peer/1, unique/1, count/2,
-	genesis_wallets/0,
-	pmap/2,
-	do_until/3,
-	block_index_entry_from_block/1, get_block_index_intersection/2,
-	reset_peer/1, get_performance/1, update_timer/1,
-	bytes_to_mb_string/1
-]).
+-export([pick_random/1, pick_random/2,
+		encode/1, decode/1, safe_decode/1,
+		parse_peer/1, parse_port/1, safe_parse_peer/1, format_peer/1, unique/1, count/2,
+		genesis_wallets/0, pmap/2, pfilter/2,
+		do_until/3, block_index_entry_from_block/1, get_block_index_intersection/2,
+		reset_peer/1, get_performance/1, update_timer/1, bytes_to_mb_string/1, cast_after/3]).
 
 -include_lib("arweave/include/ar.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -122,6 +117,26 @@ pmap(Mapper, List) ->
 		fun({_, Ref}) ->
 			receive
 				{pmap_work, Ref, Mapped} -> Mapped
+			end
+		end,
+		ListWithRefs
+	).
+
+%% @doc Filter the list in parallel.
+pfilter(Fun, List) ->
+	Master = self(),
+	ListWithRefs = [{Elem, make_ref()} || Elem <- List],
+	lists:foreach(fun({Elem, Ref}) ->
+		spawn_link(fun() ->
+			Master ! {pmap_work, Ref, Fun(Elem)}
+		end)
+	end, ListWithRefs),
+	lists:filtermap(
+		fun({Elem, Ref}) ->
+			receive
+				{pmap_work, Ref, false} -> false;
+				{pmap_work, Ref, true} -> {true, Elem};
+				{pmap_work, Ref, {true, Result}} -> {true, Result}
 			end
 		end,
 		ListWithRefs
@@ -257,3 +272,8 @@ pmap_test() ->
 		X * 2
 	end,
 	?assertEqual([6, 2, 4], pmap(Mapper, [3, 1, 2])).
+
+cast_after(Delay, Module, Message) ->
+	%% Not using timer:apply_after here because send_after is more efficient:
+	%% http://erlang.org/doc/efficiency_guide/commoncaveats.html#timer-module.
+	erlang:send_after(Delay, Module, {'$gen_cast', Message}).

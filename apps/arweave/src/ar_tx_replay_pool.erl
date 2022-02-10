@@ -6,7 +6,7 @@
 %%% @end
 -module(ar_tx_replay_pool).
 
--export([verify_tx/1, verify_block_txs/1, pick_txs_to_mine/1]).
+-export([verify_tx/1, verify_tx/2, verify_block_txs/1, pick_txs_to_mine/1]).
 
 -include_lib("arweave/include/ar.hrl").
 
@@ -18,44 +18,39 @@
 %% wallet list references, and data size. Therefore, the function is suitable
 %% for on-edge verification where we want to accept potentially conflicting
 %% transactions to avoid consensus issues later.
-%% @end
 verify_tx(Args) ->
-	{TX, Diff, Height, BlockAnchors, RecentTXMap, Mempool, WalletList} = Args,
-	verify_tx2({
-		TX,
-		Diff,
-		Height,
-		os:system_time(seconds),
-		WalletList,
-		BlockAnchors,
-		RecentTXMap,
-		Mempool
-	}).
+	verify_tx(Args, verify_signature).
+
+verify_tx(Args, VerifySignature) ->
+	{TX, Rate, Height, BlockAnchors, RecentTXMap, Mempool, WalletList} = Args,
+	verify_tx2({TX, Rate, Height, os:system_time(seconds), WalletList, BlockAnchors, RecentTXMap,
+			Mempool, VerifySignature}).
 
 %% @doc Verify the transactions are valid for the block taken into account
 %% the given current difficulty and height, the previous blocks' wallet list,
 %% and recent weave transactions.
 %% @end
 verify_block_txs(Args) ->
-	{TXs, Diff, Height, Timestamp, WalletList, BlockAnchors, RecentTXMap} = Args,
+	{TXs, Rate, Height, Timestamp, WalletList, BlockAnchors, RecentTXMap} = Args,
 	verify_block_txs(
 		TXs,
-		{Diff, Height, Timestamp, WalletList, BlockAnchors, RecentTXMap, maps:new(), 0, 0}
+		{Rate, Height, Timestamp, WalletList, BlockAnchors, RecentTXMap, maps:new(), 0, 0}
 	).
 
 verify_block_txs([], _Args) ->
 	valid;
 verify_block_txs([TX | TXs], Args) ->
-	{Diff, Height, Timestamp, Wallets, BlockAnchors, RecentTXMap, Mempool, C, Size} = Args,
+	{Rate, Height, Timestamp, Wallets, BlockAnchors, RecentTXMap, Mempool, C, Size} = Args,
 	case verify_tx2({
 		TX,
-		Diff,
+		Rate,
 		Height,
 		Timestamp,
 		Wallets,
 		BlockAnchors,
 		RecentTXMap,
-		Mempool
+		Mempool,
+		verify_signature
 	}) of
 		valid ->
 			NewMempool = maps:put(TX#tx.id, no_tx, Mempool),
@@ -80,7 +75,7 @@ verify_block_txs([TX | TXs], Args) ->
 					verify_block_txs(
 						TXs,
 						{
-							Diff,
+							Rate,
 							Height,
 							Timestamp,
 							NewWallets,
@@ -105,11 +100,11 @@ verify_block_txs([TX | TXs], Args) ->
 %% block anchors to newest.
 %% @end
 pick_txs_to_mine(Args) ->
-	{BlockAnchors, RecentTXMap, Height, Diff, Timestamp, Wallets, TXs} = Args,
+	{BlockAnchors, RecentTXMap, Height, Rate, Timestamp, Wallets, TXs} = Args,
 	pick_txs_under_size_limit(
 		sort_txs_by_utility_and_anchor(TXs, BlockAnchors),
 		{
-			Diff,
+			Rate,
 			Height,
 			Timestamp,
 			Wallets,
@@ -126,8 +121,9 @@ pick_txs_to_mine(Args) ->
 %%%===================================================================
 
 verify_tx2(Args) ->
-	{TX, Diff, Height, Timestamp, FloatingWallets, BlockAnchors, RecentTXMap, Mempool} = Args,
-	case ar_tx:verify(TX, Diff, Height, FloatingWallets, Timestamp) of
+	{TX, Rate, Height, Timestamp, FloatingWallets, BlockAnchors, RecentTXMap, Mempool,
+			VerifySignature} = Args,
+	case ar_tx:verify(TX, Rate, Height, FloatingWallets, Timestamp, VerifySignature) of
 		true ->
 			verify_anchor(TX, Height, FloatingWallets, BlockAnchors, RecentTXMap, Mempool);
 		false ->
@@ -192,17 +188,9 @@ verify_tx_in_mempool(TX, Mempool) ->
 pick_txs_under_size_limit([], _Args) ->
 	[];
 pick_txs_under_size_limit([TX | TXs], Args) ->
-	{Diff, Height, Timestamp, Wallets, BlockAnchors, RecentTXMap, Mempool, Size, Count} = Args,
-	case verify_tx2({
-		TX,
-		Diff,
-		Height,
-		Timestamp,
-		Wallets,
-		BlockAnchors,
-		RecentTXMap,
-		Mempool
-	}) of
+	{Rate, Height, Timestamp, Wallets, BlockAnchors, RecentTXMap, Mempool, Size, Count} = Args,
+	case verify_tx2({TX, Rate, Height, Timestamp, Wallets, BlockAnchors, RecentTXMap, Mempool,
+			verify_signature}) of
 		valid ->
 			NewMempool = maps:put(TX#tx.id, no_tx, Mempool),
 			NewWallets = ar_node_utils:apply_tx(Wallets, TX, Height),
@@ -221,7 +209,7 @@ pick_txs_under_size_limit([TX | TXs], Args) ->
 					pick_txs_under_size_limit(
 						TXs,
 						{
-							Diff,
+							Rate,
 							Height,
 							Timestamp,
 							Wallets,
@@ -236,7 +224,7 @@ pick_txs_under_size_limit([TX | TXs], Args) ->
 					[TX | pick_txs_under_size_limit(
 						TXs,
 						{
-							Diff,
+							Rate,
 							Height,
 							Timestamp,
 							NewWallets,
@@ -252,7 +240,7 @@ pick_txs_under_size_limit([TX | TXs], Args) ->
 			pick_txs_under_size_limit(
 				TXs,
 				{
-					Diff,
+					Rate,
 					Height,
 					Timestamp,
 					Wallets,
@@ -279,11 +267,11 @@ compare_txs(TX1, TX2, BHL) ->
 	end.
 
 compare_txs_by_utility(TX1, TX2, BHL) ->
-	U1 = ar_tx_queue:utility(TX1),
-	U2 = ar_tx_queue:utility(TX2),
+	U1 = ar_tx:utility(TX1),
+	U2 = ar_tx:utility(TX2),
 	case U1 == U2 of
 		true ->
-			compare_anchors(TX1, TX2, BHL);
+			compare_anchors(TX1#tx.last_tx, TX2#tx.last_tx, BHL);
 		false ->
 			U1 > U2
 	end.

@@ -1,12 +1,8 @@
 -module(ar_randomx_state).
 
--export([
-	start/0, start_block_polling/0, reset/0,
-	hash/2,
-	randomx_state_by_height/1,
-	debug_server/0
-]).
--export([init/2, init/4, swap_height/1]).
+-export([init/2, init/4, start/0, start_block_polling/0, reset/0, hash/2,
+		hash_long_with_entropy/2, randomx_state_by_height/1, swap_height/1, get_key_block/1,
+		debug_server/0]).
 
 -include_lib("arweave/include/ar.hrl").
 
@@ -15,6 +11,30 @@
 	key_cache,
 	next_key_gen_ahead
 }).
+
+%%%===================================================================
+%%% Public interface.
+%%%===================================================================
+
+init(BI, Peers) ->
+	CurrentHeight = length(BI) - 1,
+	SwapHeights = lists:usort([
+		swap_height(CurrentHeight + ?STORE_BLOCKS_BEHIND_CURRENT),
+		swap_height(max(0, CurrentHeight - ?STORE_BLOCKS_BEHIND_CURRENT))
+	]),
+	Init = fun(SwapHeight) ->
+		{ok, Key} = randomx_key(SwapHeight, BI, Peers),
+		init(whereis(?MODULE), SwapHeight, Key, erlang:system_info(schedulers_online))
+	end,
+	lists:foreach(Init, SwapHeights).
+
+init(Server, SwapHeight, Key, Threads) ->
+	ar:console(
+		"Initialising RandomX dataset for fast hashing. Swap height: ~p, Key: ~p. "
+		"The process may take several minutes.~n", [SwapHeight, ar_util:encode(Key)]
+	),
+	Server ! {add_randomx_state, SwapHeight, {fast, ar_mine_randomx:init_fast(Key, Threads)}},
+	ar:console("RandomX dataset initialisation for swap height ~p complete.~n", [SwapHeight]).
 
 start() ->
 	Pid = spawn_link(fun server/0),
@@ -38,6 +58,17 @@ hash(Height, Data) ->
 			ar_mine_randomx:hash_light(LightState, Data)
 	end.
 
+hash_long_with_entropy(Height, Data) ->
+	case randomx_state_by_height(Height) of
+		{state, {fast, FastState}} ->
+			ar_mine_randomx:hash_fast_long_with_entropy(FastState, Data);
+		{state, {light, LightState}} ->
+			ar_mine_randomx:hash_light_long_with_entropy(LightState, Data);
+		{key, Key} ->
+			LightState = ar_mine_randomx:init_light(Key),
+			ar_mine_randomx:hash_light_long_with_entropy(LightState, Data)
+	end.
+
 randomx_state_by_height(Height) when is_integer(Height) andalso Height >= 0 ->
 	Ref = make_ref(),
 	whereis(?MODULE) ! {get_state_by_height, Height, Ref, self()},
@@ -52,25 +83,26 @@ randomx_state_by_height(Height) when is_integer(Height) andalso Height >= 0 ->
 			{key, Key}
 	end.
 
+swap_height(Height) ->
+	(Height div ?RANDOMX_KEY_SWAP_FREQ) * ?RANDOMX_KEY_SWAP_FREQ.
+
+get_key_block(H) ->
+	case ets:lookup(ar_randomx_state_key_blocks, H) of
+		[{_, B}] ->
+			{ok, B};
+		_ ->
+			not_found
+	end.
+
 debug_server() ->
 	whereis(?MODULE) ! {get_state, self()},
 	receive
 		{state, State} -> State
 	end.
 
-init(BI, Peers) ->
-	CurrentHeight = length(BI) - 1,
-	SwapHeights = lists:usort([
-		swap_height(CurrentHeight + ?STORE_BLOCKS_BEHIND_CURRENT),
-		swap_height(max(0, CurrentHeight - ?STORE_BLOCKS_BEHIND_CURRENT))
-	]),
-	Init = fun(SwapHeight) ->
-		{ok, Key} = randomx_key(SwapHeight, BI, Peers),
-		init(whereis(?MODULE), SwapHeight, Key, erlang:system_info(schedulers_online))
-	end,
-	lists:foreach(Init, SwapHeights).
-
-%% PRIVATE
+%%%===================================================================
+%%% Private functions.
+%%%===================================================================
 
 server() ->
 	server(init_state()).
@@ -112,12 +144,27 @@ server(State) ->
 		{get_state, From} ->
 			From ! {state, State},
 			State;
-		{cache_randomx_key, SwapHeight, Key} ->
+		{cache_randomx_key, SwapHeight, KeyB} ->
+			Key = KeyB#block.hash,
+			cache_key_block(KeyB),
 			State#state{ key_cache = maps:put(SwapHeight, Key, State#state.key_cache) };
 		reset ->
 			init_state()
 	end,
 	server(NewState).
+
+cache_key_block(B) ->
+	ets:insert(ar_randomx_state_key_blocks, {B#block.indep_hash, B}),
+	ets:insert(ar_randomx_state_key_heights, {B#block.height, B#block.indep_hash}),
+	case ets:info(ar_randomx_state_key_heights, size) > 10 of
+		true ->
+			OldestHeight = ets:first(ar_randomx_state_key_heights),
+			[{_, OldestH}] = ets:lookup(ar_randomx_state_key_heights, OldestHeight),
+			ets:delete(ar_randomx_state_key_heights, OldestHeight),
+			ets:delete(ar_randomx_state_key_blocks, OldestH);
+		false ->
+			ok
+	end.
 
 poll_new_blocks(State) ->
 	case ar_node:is_joined() of
@@ -151,10 +198,11 @@ remove_old_randomx_states(State, CurrentHeight) ->
 		IsOutdated,
 		maps:keys(RandomxStates)
 	),
-	%% RandomX allocates the memory for the dataset internally, bypassing enif_alloc. This presumably causes
-	%% GC to be very reluctant to release the memory. Here we explicitly trigger the release. It is scheduled
-	%% to happen after some time to account for other processes possibly still using it. In case some process
-	%% is still using it, the release call will fail, leaving it for GC to handle.
+	%% RandomX allocates the memory for the dataset internally, bypassing enif_alloc.
+	%% This presumably causes GC to be very reluctant to release the memory. Here we
+	%% explicitly trigger the release. It is scheduled to happen after some time to account
+	%% for other processes possibly still using it. In case some process is still using it,
+	%% the release call will fail, leaving it for GC to handle.
 	lists:foreach(
 		fun(Key) ->
 			{_, S} = maps:get(Key, RandomxStates),
@@ -182,9 +230,6 @@ maybe_init_next(State, CurrentHeight) ->
 		_ ->
 			State
 	end.
-
-swap_height(Height) ->
-	(Height div ?RANDOMX_KEY_SWAP_FREQ) * ?RANDOMX_KEY_SWAP_FREQ.
 
 ensure_initialized(State, SwapHeight) ->
 	case maps:find(SwapHeight, State#state.randomx_states) of
@@ -219,18 +264,11 @@ init(Server, SwapHeight, Threads) ->
 			init(Server, SwapHeight, Threads)
 	end.
 
-init(Server, SwapHeight, Key, Threads) ->
-	ar:console(
-		"Initialising RandomX dataset for fast hashing. Swap height: ~p, Key: ~p. "
-		"The process may take several minutes.~n", [SwapHeight, ar_util:encode(Key)]
-	),
-	Server ! {add_randomx_state, SwapHeight, {fast, ar_mine_randomx:init_fast(Key, Threads)}},
-	ar:console("RandomX dataset initialisation for swap height ~p complete.~n", [SwapHeight]).
-
 %% @doc Return the key used in RandomX by key swap height. The key is the
 %% dependent hash from the block at the previous swap height. If RandomX is used
 %% already by the first ?RANDOMX_KEY_SWAP_FREQ blocks, then a hardcoded key is
 %% used since there is no old enough block to fetch the key from.
+%% @end
 randomx_key(SwapHeight) when SwapHeight < ?RANDOMX_KEY_SWAP_FREQ ->
 	{ok, <<"Arweave Genesis RandomX Key">>};
 randomx_key(SwapHeight) ->
@@ -238,7 +276,7 @@ randomx_key(SwapHeight) ->
 	case get_block(KeyBlockHeight) of
 		{ok, KeyB} ->
 			Key = KeyB#block.hash,
-			whereis(?MODULE) ! {cache_randomx_key, SwapHeight, Key},
+			whereis(?MODULE) ! {cache_randomx_key, SwapHeight, KeyB},
 			{ok, Key};
 		unavailable ->
 			unavailable
@@ -253,30 +291,40 @@ get_block(Height) ->
 	end.
 
 get_block(BH, BI) ->
-	Peers = ar_bridge:get_remote_peers(),
-	get_block(BH, BI, Peers).
+	try
+		Peers = ar_bridge:get_remote_peers(),
+		get_block(BH, BI, Peers)
+	catch Type:Exception:StackTrace ->
+		?LOG_ERROR([
+			{event, randomx_state_server_failed_to_fetch_peers},
+			{error, io_lib:format("~p ~p ~p", [Type, Exception, StackTrace])}
+		]),
+		get_block(BH, BI)
+	end.
 
 get_block(Height, BI, Peers) when is_integer(Height) ->
 	{BH, _, _} = lists:nth(Height + 1, lists:reverse(BI)),
 	get_block(BH, BI, Peers);
 get_block(BH, BI, Peers) ->
-	case ar_http_iface_client:get_block(Peers, BH) of
+	case ar_storage:read_block(BH) of
+		B when is_record(B, block) ->
+			{ok, B};
 		unavailable ->
-			unavailable;
-		B ->
-			case ar_weave:indep_hash(B) of
-				BH ->
-					SizeTaggedTXs = ar_block:generate_size_tagged_list_from_txs(B#block.txs),
-					ar_data_sync:add_block(B, SizeTaggedTXs),
-					ar_header_sync:add_block(B),
-					{ok, B};
-				InvalidBH ->
-					?LOG_WARNING([
-						{event, ar_randomx_state_got_invalid_block},
-						{requested_block_hash, ar_util:encode(BH)},
-						{received_block_hash, ar_util:encode(InvalidBH)}
-					]),
-					get_block(BH, BI)
+			case ar_http_iface_client:get_block_shadow(Peers, BH) of
+				unavailable ->
+					unavailable;
+				{_, B} ->
+					case ar_weave:indep_hash(B) of
+						BH ->
+							{ok, B};
+						InvalidBH ->
+							?LOG_WARNING([
+								{event, ar_randomx_state_got_invalid_block},
+								{requested_block_hash, ar_util:encode(BH)},
+								{received_block_hash, ar_util:encode(InvalidBH)}
+							]),
+							get_block(BH, BI)
+					end
 			end
 	end.
 
@@ -286,6 +334,7 @@ randomx_key(SwapHeight, BI, Peers) ->
 	KeyBlockHeight = SwapHeight - ?RANDOMX_KEY_SWAP_FREQ,
 	case get_block(KeyBlockHeight, BI, Peers) of
 		{ok, KeyB} ->
+			whereis(?MODULE) ! {cache_randomx_key, SwapHeight, KeyB},
 			{ok, KeyB#block.hash};
 		unavailable ->
 			unavailable

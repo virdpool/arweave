@@ -75,13 +75,6 @@ parse_options([{<<"polling">>, Frequency} | Rest], Config) when is_integer(Frequ
 parse_options([{<<"polling">>, Opt} | _], _) ->
 	{error, {bad_type, polling, number}, Opt};
 
-parse_options([{<<"clean">>, true} | Rest], Config) ->
-	parse_options(Rest, Config#config{ clean = true });
-parse_options([{<<"clean">>, false} | Rest], Config) ->
-	parse_options(Rest, Config);
-parse_options([{<<"clean">>, Opt} | _], _) ->
-	{error, {bad_type, clean, boolean}, Opt};
-
 parse_options([{<<"no_auto_join">>, true} | Rest], Config) ->
 	parse_options(Rest, Config#config{ auto_join = false });
 parse_options([{<<"no_auto_join">>, false} | Rest], Config) ->
@@ -94,6 +87,8 @@ parse_options([{<<"diff">>, Diff} | Rest], Config) when is_integer(Diff) ->
 parse_options([{<<"diff">>, Diff} | _], _) ->
 	{error, {bad_type, diff, number}, Diff};
 
+parse_options([{<<"mining_addr">>, <<"unclaimed">>} | Rest], Config) ->
+	parse_options(Rest, Config#config{ mining_addr = unclaimed });
 parse_options([{<<"mining_addr">>, Addr} | Rest], Config) when is_binary(Addr) ->
 	case ar_util:safe_decode(Addr) of
 		{ok, D} -> parse_options(Rest, Config#config{ mining_addr = D });
@@ -129,6 +124,12 @@ parse_options([{<<"max_emitters">>, Value} | Rest], Config) when is_integer(Valu
 parse_options([{<<"max_emitters">>, Value} | _], _) ->
 	{error, {bad_type, max_emitters, number}, Value};
 
+parse_options([{<<"tx_validators">>, Value} | Rest], Config)
+		when is_integer(Value) ->
+	parse_options(Rest, Config#config{ tx_validators = Value });
+parse_options([{<<"tx_validators">>, Value} | _], _) ->
+	{error, {bad_type, tx_validators, number}, Value};
+
 parse_options([{<<"tx_propagation_parallelization">>, Value} | Rest], Config)
 		when is_integer(Value) ->
 	parse_options(Rest, Config#config{ tx_propagation_parallelization = Value });
@@ -141,18 +142,29 @@ parse_options([{<<"max_propagation_peers">>, Value} | Rest], Config)
 parse_options([{<<"max_propagation_peers">>, Value} | _], _) ->
 	{error, {bad_type, max_propagation_peers, number}, Value};
 
+parse_options([{<<"max_block_propagation_peers">>, Value} | Rest], Config)
+		when is_integer(Value) ->
+	parse_options(Rest, Config#config{ max_block_propagation_peers = Value });
+parse_options([{<<"max_block_propagation_peers">>, Value} | _], _) ->
+	{error, {bad_type, max_block_propagation_peers, number}, Value};
+
 parse_options([{<<"sync_jobs">>, Value} | Rest], Config)
 		when is_integer(Value) ->
 	parse_options(Rest, Config#config{ sync_jobs = Value });
 parse_options([{<<"sync_jobs">>, Value} | _], _) ->
 	{error, {bad_type, sync_jobs, number}, Value};
 
-parse_options([{<<"new_mining_key">>, true} | Rest], Config) ->
-	parse_options(Rest, Config#config{ new_key = true });
-parse_options([{<<"new_mining_key">>, false} | Rest], Config) ->
-	parse_options(Rest, Config);
-parse_options([{<<"new_mining_key">>, Opt} | _], _) ->
-	{error, {bad_type, new_mining_key, boolean}, Opt};
+parse_options([{<<"header_sync_jobs">>, Value} | Rest], Config)
+		when is_integer(Value) ->
+	parse_options(Rest, Config#config{ header_sync_jobs = Value });
+parse_options([{<<"header_sync_jobs">>, Value} | _], _) ->
+	{error, {bad_type, header_sync_jobs, number}, Value};
+
+parse_options([{<<"disk_pool_jobs">>, Value} | Rest], Config)
+		when is_integer(Value) ->
+	parse_options(Rest, Config#config{ disk_pool_jobs = Value });
+parse_options([{<<"disk_pool_jobs">>, Value} | _], _) ->
+	{error, {bad_type, disk_pool_jobs, number}, Value};
 
 parse_options([{<<"load_mining_key">>, DataDir} | Rest], Config) when is_binary(DataDir) ->
 	parse_options(Rest, Config#config{ load_key = binary_to_list(DataDir) });
@@ -288,6 +300,16 @@ parse_options([{<<"webhooks">>, WebhookConfigs} | Rest], Config) when is_list(We
 parse_options([{<<"webhooks">>, Webhooks} | _], _) ->
 	{error, {bad_type, webhooks, array}, Webhooks};
 
+parse_options([{<<"semaphores">>, Semaphores} | Rest], Config) when is_tuple(Semaphores) ->
+	case parse_semaphores(Semaphores, Config#config.semaphores) of
+		{ok, ParsedSemaphores} ->
+			parse_options(Rest, Config#config{ semaphores = ParsedSemaphores });
+		error ->
+			{error, bad_semaphores, Semaphores}
+	end;
+parse_options([{<<"semaphores">>, Semaphores} | _], _) ->
+	{error, {bad_type, semaphores, object}, Semaphores};
+
 parse_options([{<<"max_connections">>, MaxConnections} | Rest], Config)
 		when is_integer(MaxConnections) ->
 	parse_options(Rest, Config#config{ max_connections = MaxConnections });
@@ -312,6 +334,15 @@ parse_options([{<<"max_disk_pool_data_root_buffer_mb">>, D} | Rest], Config) whe
 
 parse_options([{<<"randomx_bulk_hashing_iterations">>, D} | Rest], Config) when is_integer(D) ->
 	parse_options(Rest, Config#config{ randomx_bulk_hashing_iterations = D });
+
+parse_options([{<<"disk_cache_size_mb">>, D} | Rest], Config) when is_integer(D) ->
+	parse_options(Rest, Config#config{ disk_cache_size = D });
+
+parse_options([{<<"packing_rate">>, D} | Rest], Config) when is_integer(D) ->
+	parse_options(Rest, Config#config{ packing_rate = D });
+
+parse_options([{<<"debug">>, B} | Rest], Config) when is_boolean(B) ->
+	parse_options(Rest, Config#config{ debug = B });
 
 parse_options([Opt | _], _) ->
 	{error, unknown, Opt};
@@ -371,3 +402,20 @@ parse_webhook_events([Event | Rest], Events) ->
 	end;
 parse_webhook_events([], Events) ->
 	{ok, lists:reverse(Events)}.
+
+parse_semaphores({[Semaphore | Semaphores]}, ParsedSemaphores) when is_tuple(Semaphore) ->
+	parse_semaphores({Semaphores}, parse_semaphore(Semaphore, ParsedSemaphores));
+parse_semaphores({[]}, ParsedSemaphores) ->
+	{ok, ParsedSemaphores};
+parse_semaphores(_, _) ->
+	error.
+
+parse_semaphore({Name, Number}, ParsedSemaphores)
+		when is_binary(Name), is_number(Number) ->
+	maps:put(binary_to_existing_atom(Name), Number, ParsedSemaphores);
+parse_semaphore({Unknown, _N}, ParsedSemaphores) ->
+	?LOG_WARNING([
+		{event, configured_semaphore_bad_type},
+		{semaphore, io_lib:format("~p", [Unknown])}
+	]),
+	ParsedSemaphores.

@@ -3,23 +3,12 @@
 -include_lib("arweave/include/ar.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
--export([
-	open/1, open/2, open_without_column_families/2,
-	repair/1,
-	create_column_family/3,
-	close/1,
-	put/3,
-	get/2,
-	get_next_by_prefix/4,
-	cyclic_iterator_move/2,
-	get_prev/2,
-	get_range/2,
-	get_range/3,
-	delete/2,
-	delete_range/3,
-	destroy/1,
-	count/1
-]).
+-export([open/1, open/2, open_without_column_families/2,
+		repair/1, create_column_family/3, close/1, put/3,
+		get/2, get_next_by_prefix/4, get_next/2,
+		cyclic_iterator_move/2, get_prev/2, get_range/2,
+		get_range/3, delete/2, delete_range/3, destroy/1,
+		count/1]).
 
 open(Name) ->
 	open_without_column_families(Name, []).
@@ -75,7 +64,14 @@ get(DB, Key) ->
 %% @doc Return the key ({ok, Key, Value}) equal to or bigger than OffsetBinary with
 %% either the matching PrefixBitSize first bits or PrefixBitSize first bits bigger by one.
 get_next_by_prefix({DB, CF}, PrefixBitSize, KeyBitSize, OffsetBinary) ->
-	case rocksdb:iterator(DB, CF, [{prefix_same_as_start, true}]) of
+	case catch rocksdb:iterator(DB, CF, [{prefix_same_as_start, true}]) of
+		{'EXIT', _} ->
+			<< Offset: 256 >> = OffsetBinary,
+			?LOG_WARNING([{event, failed_to_instantiate_rocksdb_iterator},
+					{offset, Offset}]),
+			%% Presumably, happens when there is a lot of writing activity in the vicinity
+			%% of the offset.
+			{error, temporary_error};
 		{ok, Iterator} ->
 			case rocksdb:iterator_move(Iterator, {seek, OffsetBinary}) of
 				{error, invalid_iterator} ->
@@ -85,6 +81,31 @@ get_next_by_prefix({DB, CF}, PrefixBitSize, KeyBitSize, OffsetBinary) ->
 					<< Prefix:PrefixBitSize, _:SuffixBitSize >> = OffsetBinary,
 					NextPrefixSmallestBytes = << (Prefix + 1):PrefixBitSize, 0:SuffixBitSize >>,
 					rocksdb:iterator_move(Iterator, {seek, NextPrefixSmallestBytes});
+				Reply ->
+					Reply
+			end;
+		Error ->
+			Error
+	end.
+
+get_next({DB, CF}, Cursor) ->
+	case rocksdb:iterator(DB, CF, [{total_order_seek, true}]) of
+		{ok, Iterator} ->
+			case rocksdb:iterator_move(Iterator, Cursor) of
+				{error, invalid_iterator} ->
+					none;
+				Reply ->
+					Reply
+			end;
+		Error ->
+			Error
+	end;
+get_next(DB, Cursor) ->
+	case rocksdb:iterator(DB, [{total_order_seek, true}]) of
+		{ok, Iterator} ->
+			case rocksdb:iterator_move(Iterator, Cursor) of
+				{error, invalid_iterator} ->
+					none;
 				Reply ->
 					Reply
 			end;
@@ -121,6 +142,13 @@ cyclic_iterator_move({DB, CF}, Cursor) ->
 
 get_prev({DB, CF}, OffsetBinary) ->
 	case rocksdb:iterator(DB, CF, [{total_order_seek, true}]) of
+		{ok, Iterator} ->
+			rocksdb:iterator_move(Iterator, {seek_for_prev, OffsetBinary});
+		Error ->
+			Error
+	end;
+get_prev(DB, OffsetBinary) ->
+	case rocksdb:iterator(DB, [{total_order_seek, true}]) of
 		{ok, Iterator} ->
 			rocksdb:iterator_move(Iterator, {seek_for_prev, OffsetBinary});
 		Error ->

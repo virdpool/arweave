@@ -1,22 +1,9 @@
 %%% @doc A set of non-overlapping intervals.
 -module(ar_intervals).
 
--export([
-	new/0,
-	add/3,
-	delete/3,
-	cut/2,
-	is_inside/2,
-	sum/1,
-	outerjoin/2,
-	get_interval_by_nth_inner_number/2,
-	serialize/2,
-	safe_from_etf/1,
-	count/1,
-	is_empty/1,
-	take_smallest/1,
-	take_largest/1
-]).
+-export([new/0, from_list/1, add/3, delete/3, cut/2, is_inside/2, sum/1, union/2, serialize/2,
+		safe_from_etf/1, count/1, is_empty/1, take_smallest/1, take_largest/1, largest/1,
+		smallest/1, iterator_from/2, next/1, fold/3, outerjoin/2, intersection/2]).
 
 -include_lib("eunit/include/eunit.hrl").
 
@@ -27,6 +14,10 @@
 %% @doc Create an empty set of intervals.
 new() ->
 	gb_sets:new().
+
+%% @doc Create a set from a list of {End, Start} pairs.
+from_list(L) ->
+	lists:foldl(fun({End, Start}, Acc) -> add(Acc, End, Start) end, new(), L).
 
 %% @doc Add a new interval. Intervals are compacted - e.g., (2, 1) and (1, 0) are joined
 %% into (2, 0). Also, if two intervals intersect each other, they are joined.
@@ -78,20 +69,22 @@ is_inside(Intervals, Number) ->
 sum(Intervals) ->
 	gb_sets:fold(fun({End, Start}, Acc) -> Acc + End - Start end, 0, Intervals).
 
-%% @doc Return a set of intervals containing the points from the second given set of
-%% intervals and excluding the points from the first given set of intervals.
-%% @end
-outerjoin(I1, I2) ->
-	intersection(inverse(I1), I2).
-
-%% @doc Return {start, n, end} where {start, end} is the interval from the set
-%% containing the found point n, from [start, end), and n is the Nth (starting from 0) point
-%% contained in the set of intervals when counted starting from the smallest interval, including
-%% the left bounds and excluding the right bounds.
-%% Raises a none exception, if the set does not contain enough points to find N.
-%% @end
-get_interval_by_nth_inner_number(Intervals, N) ->
-	get_interval_by_nth_inner_number2(gb_sets:iterator(Intervals), N).
+%% @doc Return the set of intervals consisting of the points of intervals from both sets.
+union(I1, I2) ->
+	{Longer, Shorter} =
+		case gb_sets:size(I1) > gb_sets:size(I2) of
+			true ->
+				{I1, I2};
+			false ->
+				{I2, I1}
+		end,
+	gb_sets:fold(
+		fun({End, Start}, Acc) ->
+			add(Acc, End, Start)
+		end,
+		Longer,
+		Shorter
+	).
 
 %% @doc Serialize a subset of the intervals using the requested format, etf | json.
 %% The subset is always smaller than or equal to Limit. If random_subset key is present,
@@ -135,6 +128,47 @@ take_smallest(Intervals) ->
 take_largest(Intervals) ->
 	gb_sets:take_largest(Intervals).
 
+%% @doc A proxy for gb_sets:smallest/1.
+smallest(Intervals) ->
+	gb_sets:smallest(Intervals).
+
+%% @doc A proxy for gb_sets:largest/1.
+largest(Intervals) ->
+	gb_sets:largest(Intervals).
+
+%% @doc A proxy for gb_sets:iterator_from/2.
+iterator_from(Interval, Intervals) ->
+	gb_sets:iterator_from(Interval, Intervals).
+
+%% @doc A proxy for gb_sets:next/1.
+next(Iterator) ->
+	gb_sets:next(Iterator).
+
+%% @doc A proxy for gb_sets:fold/3.
+fold(Fun, Acc, Intervals) ->
+	gb_sets:fold(Fun, Acc, Intervals).
+
+%% @doc Return a set of intervals containing the points from the second given set of
+%% intervals and excluding the points from the first given set of intervals.
+outerjoin(I1, I2) ->
+	%% intersection(inverse(I1), I2) also works but slower because inverse is relatively
+	%% expensive. intersection(I1, I2) is expected to be relatively small so inverting it
+	%% is quick.
+	intersection(inverse(intersection(I1, I2)), I2).
+
+%% @doc Return the set of intervals - the intersection of the two given sets.
+intersection(I1, I2) ->
+	case gb_sets:is_empty(I1) orelse gb_sets:is_empty(I2) of
+		true ->
+			new();
+		false ->
+			{_, Start1} = gb_sets:smallest(I1),
+			{_, Start2} = gb_sets:smallest(I2),
+			Start = min(Start1, Start2),
+			intersection(gb_sets:iterator_from({Start, infinity}, I1),
+					gb_sets:iterator_from({Start, infinity}, I2), new())
+	end.
+
 %%%===================================================================
 %%% Private functions.
 %%%===================================================================
@@ -176,61 +210,14 @@ delete2(Iter, Intervals, End, Start) ->
 			Intervals
 	end.
 
-inverse(Intervals) ->
-	inverse(gb_sets:iterator(Intervals), 0, new()).
-
-inverse(Iterator, L, G) ->
-	case gb_sets:next(Iterator) of
-		none ->
-			gb_sets:add_element({infinity, L}, G);
-		{{End1, Start1}, I1} ->
-			G2 = case Start1 > L of true -> gb_sets:add_element({Start1, L}, G); _ -> G end,
-			L2 = End1,
-			case gb_sets:next(I1) of
-				none ->
-					gb_sets:add_element({infinity, L2}, G2);
-				{{End2, Start2}, I2} ->
-					inverse(I2, End2, gb_sets:add_element({Start2, End1}, G2))
-			end
-	end.
-
-intersection(I1, I2) ->
-	intersection(gb_sets:iterator(I1), gb_sets:iterator(I2), new()).
-
-intersection(I1, I2, G) ->
-	case {gb_sets:next(I1), gb_sets:next(I2)} of
-		{none, _} ->
-			G;
-		{_, none} ->
-			G;
-		{{{End1, _Start1}, UpdatedI1}, {{_End2, Start2}, _UpdatedI2}} when Start2 >= End1 ->
-			intersection(UpdatedI1, I2, G);
-		{{{_End1, Start1}, _UpdatedI1}, {{End2, _Start2}, UpdatedI2}} when Start1 >= End2 ->
-			intersection(I1, UpdatedI2, G);
-		{{{End1, Start1}, UpdatedI1}, {{End2, Start2}, _UpdatedI2}} when End2 >= End1 ->
-			intersection(UpdatedI1, I2, gb_sets:add_element({End1, max(Start1, Start2)}, G));
-		{{{End1, Start1}, _UpdatedI1}, {{End2, Start2}, UpdatedI2}} when End1 > End2 ->
-			intersection(I1, UpdatedI2, gb_sets:add_element({End2, max(Start1, Start2)}, G))
-	end.
-
-get_interval_by_nth_inner_number2(Iterator, N) ->
-	case gb_sets:next(Iterator) of
-		none ->
-			error(none);
-		{{End, Start}, UpdatedIterator} when N >= End - Start ->
-			get_interval_by_nth_inner_number2(UpdatedIterator, N - End + Start);
-		{{End, Start}, _UpdatedIterator} ->
-			{Start, Start + N, End}
-	end.
-
 serialize_random_subset(Intervals, Limit, Format) ->
 	case gb_sets:is_empty(Intervals) of
 		true ->
 			serialize_empty(Format);
 		false ->
-			Iterator = gb_sets:iterator(Intervals),
-			InclusionProbability = min(Limit / gb_sets:size(Intervals), 1),
-			serialize_random_subset(Iterator, InclusionProbability, [], 0, Limit, Format)
+			{Largest, _} = gb_sets:largest(Intervals),
+			RandomOffsets = [rand:uniform(Largest) || _ <- lists:seq(1, Limit)],
+			serialize_random_subset(Intervals, RandomOffsets, Format, ar_intervals:new(), Limit)
 	end.
 
 serialize_empty(etf) ->
@@ -238,27 +225,16 @@ serialize_empty(etf) ->
 serialize_empty(json) ->
 	jiffy:encode([]).
 
-serialize_random_subset(_Iterator, _Probability, L, Count, Limit, Format) when Count == Limit ->
-	serialize_list(L, Format);
-serialize_random_subset(Iterator, Probability, L, Count, Limit, Format) ->
-	case gb_sets:next(Iterator) of
+serialize_random_subset(_Intervals, [], Format, PickedIntervals, Limit) ->
+	serialize_subset(PickedIntervals, 0, Limit, Format);
+serialize_random_subset(Intervals, [Offset | Offsets], Format, PickedIntervals, Limit) ->
+	Iter = gb_sets:iterator_from({Offset, 0}, Intervals),
+	case gb_sets:next(Iter) of
 		none ->
-			serialize_list(L, Format);
-		{{End, Start}, Iterator2} ->
-			PickItem =
-				case Probability < 1 of
-					true ->
-						rand:uniform() < Probability;
-					false ->
-						true
-				end,
-			case PickItem of
-				false ->
-					serialize_random_subset(Iterator2, Probability, L, Count, Limit, Format);
-				true ->
-					L2 = [serialize_item(End, Start, Format) | L],
-					serialize_random_subset(Iterator2, Probability, L2, Count + 1, Limit, Format)
-			end
+			serialize_random_subset(Intervals, Offsets, Format, PickedIntervals, Limit);
+		{{End, Start}, _} ->
+			serialize_random_subset(Intervals, Offsets, Format,
+					ar_intervals:add(PickedIntervals, End, Start), Limit)
 	end.
 
 serialize_list(L, etf) ->
@@ -301,6 +277,40 @@ from_etf([{<< End:256 >>, << Start:256 >>} | List], R, Intervals)
 		when End > Start andalso R > End andalso Start >= 0 ->
 	from_etf(List, Start, gb_sets:add_element({End, Start}, Intervals)).
 
+inverse(Intervals) ->
+	inverse(gb_sets:iterator(Intervals), 0, new()).
+
+inverse(Iterator, L, G) ->
+	case gb_sets:next(Iterator) of
+		none ->
+			gb_sets:add_element({infinity, L}, G);
+		{{End1, Start1}, I1} ->
+			G2 = case Start1 > L of true -> gb_sets:add_element({Start1, L}, G); _ -> G end,
+			L2 = End1,
+			case gb_sets:next(I1) of
+				none ->
+					gb_sets:add_element({infinity, L2}, G2);
+				{{End2, Start2}, I2} ->
+					inverse(I2, End2, gb_sets:add_element({Start2, End1}, G2))
+			end
+	end.
+
+intersection(I1, I2, G) ->
+	case {gb_sets:next(I1), gb_sets:next(I2)} of
+		{none, _} ->
+			G;
+		{_, none} ->
+			G;
+		{{{End1, _Start1}, UpdatedI1}, {{_End2, Start2}, _UpdatedI2}} when Start2 >= End1 ->
+			intersection(UpdatedI1, I2, G);
+		{{{_End1, Start1}, _UpdatedI1}, {{End2, _Start2}, UpdatedI2}} when Start1 >= End2 ->
+			intersection(I1, UpdatedI2, G);
+		{{{End1, Start1}, UpdatedI1}, {{End2, Start2}, _UpdatedI2}} when End2 >= End1 ->
+			intersection(UpdatedI1, I2, gb_sets:add_element({End1, max(Start1, Start2)}, G));
+		{{{End1, Start1}, _UpdatedI1}, {{End2, Start2}, UpdatedI2}} when End1 > End2 ->
+			intersection(I1, UpdatedI2, gb_sets:add_element({End2, max(Start1, Start2)}, G))
+	end.
+
 %%%===================================================================
 %%% Tests.
 %%%===================================================================
@@ -311,7 +321,6 @@ intervals_test() ->
 	?assertEqual(0, sum(I)),
 	?assert(not is_inside(I, 0)),
 	?assert(not is_inside(I, 1)),
-	?assertEqual(new(), outerjoin(I, I)),
 	?assertEqual(<<"[]">>, serialize(#{ random_subset => true, format => json, limit => 1 }, I)),
 	?assertEqual(<<"[]">>, serialize(#{ start => 0, format => json, limit => 1 }, I)),
 	?assertEqual(<<"[]">>, serialize(#{ start => 1, format => json, limit => 1 }, I)),
@@ -321,8 +330,6 @@ intervals_test() ->
 	),
 	?assertEqual(new(), outerjoin(I, I)),
 	?assertEqual(new(), delete(I, 2, 1)),
-	?assertException(error, none, get_interval_by_nth_inner_number(I, 0)),
-	?assertException(error, none, get_interval_by_nth_inner_number(I, 2)),
 	I2 = add(I, 2, 1),
 	?assertEqual(1, count(I2)),
 	?assertEqual(1, sum(I2)),
@@ -330,10 +337,6 @@ intervals_test() ->
 	?assert(not is_inside(I2, 1)),
 	?assert(is_inside(I2, 2)),
 	?assert(not is_inside(I2, 3)),
-	?assertEqual({1, 1, 2}, get_interval_by_nth_inner_number(I2, 0)),
-	?assertException(error, none, get_interval_by_nth_inner_number(I2, 1)),
-	?assertEqual(new(), outerjoin(I2, I)),
-	compare(add(add(new(), 1, 0), 3, 2), outerjoin(I2, add(new(), 3, 0))),
 	?assertEqual(new(), delete(I2, 2, 1)),
 	?assertEqual(new(), delete(I2, 2, 0)),
 	?assertEqual(new(), delete(I2, 3, 1)),
@@ -372,6 +375,8 @@ intervals_test() ->
 	compare(I2, add(I2, 2, 1)),
 	compare(add(new(), 3, 1), add(I2, 3, 1)),
 	compare(add(new(), 2, 0), add(I2, 2, 0)),
+	?assertEqual(new(), outerjoin(I2, I)),
+	compare(add(add(new(), 1, 0), 3, 2), outerjoin(I2, add(new(), 3, 0))),
 	I3 = add(I2, 6, 3),
 	?assertEqual(2, count(I3)),
 	?assertEqual(4, sum(I3)),
@@ -382,15 +387,6 @@ intervals_test() ->
 	?assert(is_inside(I3, 4)),
 	?assert(is_inside(I3, 5)),
 	?assert(is_inside(I3, 6)),
-	?assertEqual({1, 1, 2}, get_interval_by_nth_inner_number(I3, 0)),
-	?assertEqual({3, 3, 6}, get_interval_by_nth_inner_number(I3, 1)),
-	?assertEqual({3, 4, 6}, get_interval_by_nth_inner_number(I3, 2)),
-	?assertEqual({3, 5, 6}, get_interval_by_nth_inner_number(I3, 3)),
-	?assertException(error, none, get_interval_by_nth_inner_number(I3, 4)),
-	I3_2 = add(new(), 7, 5),
-	compare(add(new(), 7, 5), outerjoin(I2, I3_2)),
-	compare(add(new(), 7, 6), outerjoin(I3, I3_2)),
-	compare(add(add(add(new(), 1, 0), 3, 2), 8, 6), outerjoin(I3, add(new(), 8, 0))),
 	compare(add(add(add(new(), 2, 1), 6, 5), 4, 3), delete(I3, 5, 4)),
 	compare(add(new(), 6, 5), delete(I3, 5, 1)),
 	compare(add(new(), 10, 0), add(I3, 10, 0)),
@@ -403,7 +399,7 @@ intervals_test() ->
 	compare(I3, cut(I3, 6)),
 	?assertEqual(
 		<<"[{\"6\":\"3\"},{\"2\":\"1\"}]">>,
-		serialize(#{ random_subset => true, limit => 10, format => json }, I3)
+		serialize(#{ random_subset => true, limit => 1000, format => json }, I3)
 	),
 	?assertEqual(
 		<<"[{\"6\":\"3\"},{\"2\":\"1\"}]">>,
@@ -418,10 +414,14 @@ intervals_test() ->
 		serialize(#{ start => 3, limit => 10, format => json }, I3)
 	),
 	{ok, I3_FromETF} =
-		safe_from_etf(serialize(#{ format => etf, limit => 10, random_subset => true }, I3)),
+		safe_from_etf(serialize(#{ format => etf, limit => 1000, random_subset => true }, I3)),
 	compare(I3, I3_FromETF),
 	compare(I3, add(I3, 4, 3)),
 	compare(add(new(), 6, 1), add(I3, 3, 1)),
+	I3_2 = add(new(), 7, 5),
+	compare(add(new(), 7, 5), outerjoin(I2, I3_2)),
+	compare(add(new(), 7, 6), outerjoin(I3, I3_2)),
+	compare(add(add(add(new(), 1, 0), 3, 2), 8, 6), outerjoin(I3, add(new(), 8, 0))),
 	I4 = add(I3, 7, 6),
 	?assertEqual(2, count(I4)),
 	?assertEqual(5, sum(I4)),
@@ -434,20 +434,16 @@ intervals_test() ->
 	?assert(is_inside(I4, 6)),
 	?assert(is_inside(I4, 7)),
 	?assert(not is_inside(I4, 8)),
-	?assertEqual({1, 1, 2}, get_interval_by_nth_inner_number(I4, 0)),
-	?assertEqual({3, 3, 7}, get_interval_by_nth_inner_number(I4, 1)),
-	?assertEqual({3, 6, 7}, get_interval_by_nth_inner_number(I4, 4)),
-	compare(add(add(new(), 1, 0), 3, 2), outerjoin(I4, add(new(), 6, 0))),
 	?assertEqual(new(), cut(I4, 1)),
 	?assertEqual(new(), cut(I4, 0)),
 	compare(add(I2, 5, 3), cut(I4, 5)),
 	compare(I4, cut(I4, 7)),
 	?assertEqual(
 		<<"[{\"7\":\"3\"},{\"2\":\"1\"}]">>,
-		serialize(#{ format => json, limit => 10, random_subset => true }, I4)
+		serialize(#{ format => json, limit => 1000, random_subset => true }, I4)
 	),
-	{ok, I4_FromETF} =
-		safe_from_etf(serialize(#{ limit => count(I4), random_subset => true, format => etf }, I4)),
+	{ok, I4_FromETF} = safe_from_etf(serialize(#{ limit => 1000, random_subset => true,
+			format => etf }, I4)),
 	compare(I4, I4_FromETF),
 	I5 = add(I4, 3, 2),
 	?assertEqual(1, count(I5)),

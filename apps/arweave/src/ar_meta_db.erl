@@ -79,7 +79,7 @@ increase(Key, Val) ->
 	gen_server:cast(?MODULE, {increase, Key, Val}).
 
 update_peer_performance(Peer, Time, Bytes) ->
-	gen_server:cast(update_peer_performance, {Peer, Time, Bytes}).
+	gen_server:cast(?MODULE, {update_peer_performance, Peer, Time, Bytes}).
 
 %% @doc Remove entries from the performance database older than ?PEER_TMEOUT.
 purge_peer_performance() ->
@@ -102,7 +102,6 @@ init(_) ->
 	ets:insert(?MODULE, {port, Config#config.port}),
 	ets:insert(?MODULE, {mine, Config#config.mine}),
 	ets:insert(?MODULE, {max_miners, Config#config.max_miners}),
-	ets:insert(?MODULE, {max_emitters, Config#config.max_emitters}),
 	ets:insert(?MODULE,
 		{tx_propagation_parallelization, Config#config.tx_propagation_parallelization}),
 	ets:insert(?MODULE,
@@ -118,9 +117,6 @@ init(_) ->
 	ets:insert(?MODULE,
 		{disk_pool_data_root_expiration_time_us,
 			Config#config.disk_pool_data_root_expiration_time * 1000000}),
-	ets:insert(?MODULE, {max_disk_pool_buffer_mb, Config#config.max_disk_pool_buffer_mb}),
-	ets:insert(?MODULE,
-		{max_disk_pool_data_root_buffer_mb, Config#config.max_disk_pool_data_root_buffer_mb}),
 	ets:insert(?MODULE,
 		{randomx_bulk_hashing_iterations, Config#config.randomx_bulk_hashing_iterations}),
 	%% Store enabled features.
@@ -136,10 +132,6 @@ init(_) ->
 		end,
 		Config#config.disable
 	),
-	%% Prepare the storage for operation.
-	spawn(fun() -> ar_storage:init() end),
-	%% Optionally clear the block cache.
-	if Config#config.clean -> ar_storage:clear(); true -> do_nothing end,
 	{ok, #{}}.
 
 handle_call(reset, _From, State) ->
