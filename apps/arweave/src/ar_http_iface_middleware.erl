@@ -450,6 +450,34 @@ handle(<<"POST">>, [<<"chunk">>], Req, Pid) ->
 			end
 	end;
 
+handle(<<"POST">>, [<<"mine">>], Req, Pid) ->
+	case check_internal_api_secret(Req) of
+		pass ->
+			case read_complete_body(Req, Pid) of
+				{ok, Body, _} ->
+					case ar_serialize:json_decode(Body, [{return_maps, true}]) of
+						{ok, MineJSON} ->
+							ar_pool_miner:start(MineJSON),
+							{200, #{}, <<"{}">>, Req};
+						{error, _} ->
+							{400, #{}, jiffy:encode(#{ error => invalid_json }), Req}
+					end;
+				{error, body_size_too_large} ->
+					{413, #{}, <<"Payload too large">>, Req}
+			end;
+		{reject, {Status, Headers, Body}} ->
+			{Status, Headers, Body, Req}
+	end;
+
+handle(<<"GET">>, [<<"mine_get_results">>], Req, _Pid) ->
+	case check_internal_api_secret(Req) of
+		pass ->
+			CompleteJobList = ar_pool_miner:get_results(),
+			{200, #{}, jiffy:encode(#{ finished_job_list => CompleteJobList}), Req};
+		{reject, {Status, Headers, Body}} ->
+			{Status, Headers, Body, Req}
+	end;
+
 %% Share a new block to a peer.
 %% POST request to endpoint /block with the body of the request being a JSON encoded block
 %% as specified in ar_serialize.

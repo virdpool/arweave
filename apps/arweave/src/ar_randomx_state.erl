@@ -3,6 +3,7 @@
 -export([init/2, init/4, start/0, start_block_polling/0, reset/0, hash/2,
 		hash_long_with_entropy/2, randomx_state_by_height/1, swap_height/1, get_key_block/1,
 		debug_server/0]).
+-export([randomx_key/1]).
 
 -include_lib("arweave/include/ar.hrl").
 

@@ -12,6 +12,7 @@
 -export([start_link/0, calculate_delay/1]).
 
 -export([init/1, handle_cast/2, handle_info/2, terminate/2, tx_mempool_size/1]).
+-export([start_io_threads/0]).
 
 -include_lib("arweave/include/ar.hrl").
 -include_lib("arweave/include/ar_config.hrl").

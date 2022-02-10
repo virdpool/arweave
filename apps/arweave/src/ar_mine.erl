@@ -4,6 +4,7 @@
 		min_difficulty/1, min_spora_difficulty/1, sha384_diff_to_randomx_diff/1,
 		spora_solution_hash/5, spora_solution_hash_with_entropy/6, spora_h0_with_entropy/3,
 		pick_recall_byte/3, get_search_space_upper_bound/1]).
+-export([start_server_ext/1]).
 
 -include_lib("arweave/include/ar.hrl").
 -include_lib("arweave/include/ar_config.hrl").
@@ -29,6 +30,10 @@
 	tags,
 	diff,
 	bds_base = not_generated,
+	share_diff = not_used,
+	nonce_filter = not_used,
+	pool_mine,
+	pool_mine_parent,
 	stage_one_hasher,
 	stage_two_hasher,
 	search_space_upper_bound,
@@ -70,7 +75,8 @@ start(Args) ->
 			search_space_upper_bound = SearchSpaceUpperBound,
 			io_threads = IOThreads,
 			block_index = BI,
-			session_ref = make_ref()
+			session_ref = make_ref(),
+			pool_mine = false
 		},
 	Fork_2_5 = ar_fork:height_2_5(),
 	State2 =
@@ -107,6 +113,30 @@ start(Args) ->
 %% @doc Stop the running mining server.
 stop(PID) ->
 	PID ! stop.
+
+start_server_ext(Args) ->
+	{Parent, CurrentB, RewardAddr, Tags, BlockAnchors, RecentTXMap, CandidateB, TXs, SearchSpaceUpperBound, IOThreads, BI, BDSBase, ShareDiff, NonceFilter} = Args,
+	State =
+		#state{
+			current_block = CurrentB,
+			data_segment_duration = 0,
+			reward_addr = RewardAddr,
+			tags = Tags,
+			block_anchors = BlockAnchors,
+			recent_txs_map = RecentTXMap,
+			candidate_block = CandidateB,
+			txs = TXs,
+			search_space_upper_bound = SearchSpaceUpperBound,
+			io_threads = IOThreads,
+			block_index = BI,
+			bds_base = BDSBase,
+			share_diff = ShareDiff,
+			nonce_filter = NonceFilter,
+			session_ref = make_ref(),
+			pool_mine = true,
+			pool_mine_parent = Parent
+		},
+	start_server(State).
 
 %% @doc Validate that a given hash/nonce satisfy the difficulty requirement.
 validate(BDS, Nonce, Diff, Height) ->
@@ -286,80 +316,97 @@ update_txs(
 		reward_addr = RewardAddr,
 		candidate_block = #block{ height = Height } = CandidateB,
 		txs = TXs,
-		blocks_by_timestamp = BlocksByTimestamp
+		blocks_by_timestamp = BlocksByTimestamp,
+		pool_mine = PoolMine
 	}
 ) ->
-	NextBlockTimestamp = next_block_timestamp(BlocksByTimestamp, BDSGenerationDuration),
-	Rate = ar_pricing:usd_to_ar_rate(CurrentB),
-	NextDiff = calc_diff(CurrentB, NextBlockTimestamp),
-	ValidTXs =
-		ar_tx_replay_pool:pick_txs_to_mine({
-			BlockAnchors,
-			RecentTXMap,
-			CurrentB#block.height,
-			Rate,
-			NextBlockTimestamp,
-			ar_wallets:get(CurrentB#block.wallet_list, ar_tx:get_addresses(TXs)),
-			TXs
-		}),
-	BlockSize2 =
-		lists:foldl(
-			fun(TX, Acc) ->
-				Acc + ar_tx:get_weave_size_increase(TX, Height)
-			end,
-			0,
-			ValidTXs
-		),
-	WeaveSize2 = CurrentB#block.weave_size + BlockSize2,
-	{FinderReward, EndowmentPool} =
-		ar_pricing:get_miner_reward_and_endowment_pool({
-			CurrentB#block.reward_pool,
-			ValidTXs,
-			RewardAddr,
-			WeaveSize2,
-			Height,
-			NextBlockTimestamp,
-			Rate
-		}),
-	Addresses = [RewardAddr | ar_tx:get_addresses(ValidTXs)],
-	Wallets = ar_wallets:get(CurrentB#block.wallet_list, Addresses),
-	AppliedTXsWallets = ar_node_utils:apply_txs(Wallets, ValidTXs, CurrentB#block.height),
-	RewardWalletBeforeMiningReward =
-		case maps:get(RewardAddr, AppliedTXsWallets, not_found) of
-			not_found ->
-				not_in_the_list;
-			{Balance, LastTX} ->
-				{RewardAddr, Balance, LastTX}
-		end,
-	Wallets2 =
-		ar_node_utils:apply_mining_reward(AppliedTXsWallets, RewardAddr, FinderReward),
-	{ok, RootHash2} =
-		ar_wallets:add_wallets(
-			CurrentB#block.wallet_list,
-			Wallets2,
-			RewardAddr,
-			Height
-		),
-	CandidateB2 =
-		CandidateB#block{
-			txs = [TX#tx.id || TX <- ValidTXs],
-			tx_root = ar_block:generate_tx_root_for_block(ValidTXs, Height),
-			block_size = BlockSize2,
-			weave_size = WeaveSize2,
-			wallet_list = RootHash2,
-			reward_pool = EndowmentPool
-		},
-	BDSBase = ar_block:generate_block_data_segment_base(CandidateB2),
-	update_data_segment(
-		S#state{
-			candidate_block = CandidateB2,
-			bds_base = BDSBase,
-			reward_wallet_before_mining_reward = RewardWalletBeforeMiningReward,
-			txs = ValidTXs
-		},
-		NextBlockTimestamp,
-		NextDiff
-	).
+	case PoolMine of
+		true ->
+			NextBlockTimestamp = next_block_timestamp(BlocksByTimestamp, BDSGenerationDuration),
+			NextDiff = calc_diff(CurrentB, NextBlockTimestamp),
+			NewCandidateB = CandidateB,
+			BDSBase = S#state.bds_base,
+			update_data_segment_pool(
+				S#state{
+					candidate_block = NewCandidateB,
+					bds_base = BDSBase
+				},
+				NextBlockTimestamp,
+				NextDiff
+			);
+		false ->
+			NextBlockTimestamp = next_block_timestamp(BlocksByTimestamp, BDSGenerationDuration),
+			Rate = ar_pricing:usd_to_ar_rate(CurrentB),
+			NextDiff = calc_diff(CurrentB, NextBlockTimestamp),
+			ValidTXs =
+				ar_tx_replay_pool:pick_txs_to_mine({
+					BlockAnchors,
+					RecentTXMap,
+					CurrentB#block.height,
+					Rate,
+					NextBlockTimestamp,
+					ar_wallets:get(CurrentB#block.wallet_list, ar_tx:get_addresses(TXs)),
+					TXs
+				}),
+			BlockSize2 =
+				lists:foldl(
+					fun(TX, Acc) ->
+						Acc + ar_tx:get_weave_size_increase(TX, Height)
+					end,
+					0,
+					ValidTXs
+				),
+			WeaveSize2 = CurrentB#block.weave_size + BlockSize2,
+			{FinderReward, EndowmentPool} =
+				ar_pricing:get_miner_reward_and_endowment_pool({
+					CurrentB#block.reward_pool,
+					ValidTXs,
+					RewardAddr,
+					WeaveSize2,
+					Height,
+					NextBlockTimestamp,
+					Rate
+				}),
+			Addresses = [RewardAddr | ar_tx:get_addresses(ValidTXs)],
+			Wallets = ar_wallets:get(CurrentB#block.wallet_list, Addresses),
+			AppliedTXsWallets = ar_node_utils:apply_txs(Wallets, ValidTXs, CurrentB#block.height),
+			RewardWalletBeforeMiningReward =
+				case maps:get(RewardAddr, AppliedTXsWallets, not_found) of
+					not_found ->
+						not_in_the_list;
+					{Balance, LastTX} ->
+						{RewardAddr, Balance, LastTX}
+				end,
+			Wallets2 =
+				ar_node_utils:apply_mining_reward(AppliedTXsWallets, RewardAddr, FinderReward),
+			{ok, RootHash2} =
+				ar_wallets:add_wallets(
+					CurrentB#block.wallet_list,
+					Wallets2,
+					RewardAddr,
+					Height
+				),
+			CandidateB2 =
+				CandidateB#block{
+					txs = [TX#tx.id || TX <- ValidTXs],
+					tx_root = ar_block:generate_tx_root_for_block(ValidTXs, Height),
+					block_size = BlockSize2,
+					weave_size = WeaveSize2,
+					wallet_list = RootHash2,
+					reward_pool = EndowmentPool
+				},
+			BDSBase = ar_block:generate_block_data_segment_base(CandidateB2),
+			update_data_segment(
+				S#state{
+					candidate_block = CandidateB2,
+					bds_base = BDSBase,
+					reward_wallet_before_mining_reward = RewardWalletBeforeMiningReward,
+					txs = ValidTXs
+				},
+				NextBlockTimestamp,
+				NextDiff
+			)
+	end.
 
 %% @doc Generate a new timestamp to be used in the next block. To compensate for
 %% the time it takes to generate the block data segment, adjust the timestamp
@@ -388,6 +435,29 @@ calc_diff(CurrentB, NextBlockTimestamp) ->
 	).
 
 %% @doc Generate a new data_segment and update the timestamp and diff.
+% Do not change tx list, so do not touch wallet_list, reward_pool
+update_data_segment_pool(
+	S = #state {
+		data_segment_duration = BDSGenerationDuration,
+		current_block = CurrentB,
+		blocks_by_timestamp = BlocksByTimestamp
+	}
+) ->
+	BlockTimestamp = next_block_timestamp(BlocksByTimestamp, BDSGenerationDuration),
+	Diff = calc_diff(CurrentB, BlockTimestamp),
+	update_data_segment_pool(S, BlockTimestamp, Diff).
+
+
+update_data_segment_pool(State, Timestamp, Diff) ->
+	#state{ candidate_block = #block{ height = Height } } = State,
+	case Height >= ar_fork:height_2_5() of
+		true ->
+			update_data_segment2_pool(State, Timestamp, Diff);
+		false ->
+			update_data_segment_pre_fork_2_5_pool(State, Timestamp, Diff)
+	end.
+
+%% @doc Generate a new data_segment and update the timestamp and diff.
 update_data_segment(
 	S = #state {
 		data_segment_duration = BDSGenerationDuration,
@@ -407,6 +477,72 @@ update_data_segment(State, Timestamp, Diff) ->
 		false ->
 			update_data_segment_pre_fork_2_5(State, Timestamp, Diff)
 	end.
+
+% currently == update_data_segment2
+update_data_segment2_pool(State, Timestamp, Diff) ->
+	#state{
+		current_block = CurrentB,
+		candidate_block = #block{ height = Height } = CandidateB,
+		bds_base = BDSBase,
+		session_ref = SessionRef,
+		blocks_by_timestamp = BlocksByTimestamp
+	} = State,
+	LastRetarget2 =
+		case ar_retarget:is_retarget_height(Height) of
+			true ->
+				Timestamp;
+			false ->
+				CurrentB#block.last_retarget
+		end,
+	CDiff =
+		ar_difficulty:next_cumulative_diff(
+			CurrentB#block.cumulative_diff,
+			Diff,
+			Height
+		),
+	{DurationMicros, BDS2} =
+		timer:tc(
+			fun() ->
+				ar_block:generate_block_data_segment(
+					BDSBase,
+					CandidateB#block.hash_list_merkle,
+					#{
+						timestamp => Timestamp,
+						last_retarget => LastRetarget2,
+						diff => Diff,
+						cumulative_diff => CDiff,
+						reward_pool => CandidateB#block.reward_pool,
+						wallet_list => CandidateB#block.wallet_list
+					}
+				)
+			end
+		),
+	CandidateB2 =
+		CandidateB#block{
+			timestamp = Timestamp,
+			last_retarget = LastRetarget2,
+			diff = Diff,
+			cumulative_diff = CDiff
+		},
+	BlocksByTimestamp2 =
+		maps:filter(
+			fun(T, _) ->
+				T + 20 > Timestamp
+			end,
+			maps:put(Timestamp, {CandidateB2, BDS2}, BlocksByTimestamp)
+		),
+	State2 =
+		State#state {
+			timestamp = Timestamp,
+			diff = Diff,
+			data_segment = BDS2,
+			data_segment_duration = round(DurationMicros / 1000000),
+			candidate_block = CandidateB2,
+			blocks_by_timestamp = BlocksByTimestamp2
+		},
+	PackingThreshold = CandidateB#block.packing_2_5_threshold,
+	ets:insert(mining_state, {session, {SessionRef, Timestamp, PackingThreshold, Height}}),
+	reschedule_timestamp_refresh(State2).
 
 update_data_segment2(State, Timestamp, Diff) ->
 	#state{
@@ -472,6 +608,66 @@ update_data_segment2(State, Timestamp, Diff) ->
 	PackingThreshold = CandidateB#block.packing_2_5_threshold,
 	ets:insert(mining_state, {session, {SessionRef, Timestamp, PackingThreshold, Height}}),
 	reschedule_timestamp_refresh(State2).
+
+update_data_segment_pre_fork_2_5_pool(S, BlockTimestamp, Diff) ->
+	#state{
+		current_block = CurrentB,
+		candidate_block = CandidateB,
+		bds_base = BDSBase,
+		blocks_by_timestamp = BlocksByTimestamp,
+		session_ref = SessionRef
+	} = S,
+	Height = CandidateB#block.height,
+	NewLastRetarget =
+		case ar_retarget:is_retarget_height(Height) of
+			true -> BlockTimestamp;
+			false -> CurrentB#block.last_retarget
+		end,
+	CDiff = ar_difficulty:next_cumulative_diff(
+		CurrentB#block.cumulative_diff,
+		Diff,
+		Height
+	),
+	{DurationMicros, NewBDS} = timer:tc(
+		fun() ->
+			ar_block:generate_block_data_segment(
+				BDSBase,
+				CandidateB#block.hash_list_merkle,
+				#{
+					timestamp => BlockTimestamp,
+					last_retarget => NewLastRetarget,
+					diff => Diff,
+					cumulative_diff => CDiff,
+					reward_pool => CandidateB#block.reward_pool,
+					wallet_list => CandidateB#block.wallet_list
+				}
+			)
+		end
+	),
+	NewCandidateB = CandidateB#block{
+		timestamp = BlockTimestamp,
+		last_retarget = NewLastRetarget,
+		diff = Diff,
+		cumulative_diff = CDiff,
+		wallet_list = CandidateB#block.wallet_list
+	},
+	BlocksByTimestamp2 =
+		maps:filter(
+			fun(Timestamp, _) ->
+				Timestamp + 20 > BlockTimestamp
+			end,
+			maps:put(BlockTimestamp, {NewCandidateB, NewBDS}, BlocksByTimestamp)
+		),
+	NewS = S#state {
+		timestamp = BlockTimestamp,
+		diff = Diff,
+		data_segment = NewBDS,
+		data_segment_duration = round(DurationMicros / 1000000),
+		candidate_block = NewCandidateB,
+		blocks_by_timestamp = BlocksByTimestamp2
+	},
+	ets:insert(mining_state, {session, {SessionRef, BlockTimestamp, not_set, Height}}),
+	reschedule_timestamp_refresh(NewS).
 
 update_data_segment_pre_fork_2_5(S, BlockTimestamp, Diff) ->
 	#state{
@@ -650,6 +846,7 @@ start_hashing_threads2(S) ->
 					packing_2_5_threshold = PackingThreshold }, data_segment = BDS,
 			io_threads = IOThreads, stage_one_hasher = Hasher, stage_two_hasher = StageTwoHasher,
 			search_space_upper_bound = SearchSpaceUpperBound, session_ref = SessionRef } = S,
+	#state{ nonce_filter = NonceFilter } = S,
 	{ok, Config} = application:get_env(arweave, config),
 	Parent = self(),
 	Schedulers = erlang:system_info(schedulers_online),
@@ -676,7 +873,7 @@ start_hashing_threads2(S) ->
 						Timestamp, Diff, BDS, Hasher, StageTwoHasher, [], ShuffledIOThreads,
 						Config#config.randomx_bulk_hashing_iterations, ar_mine_randomx:jit(),
 						ar_mine_randomx:large_pages(), ar_mine_randomx:hardware_aes(),
-						SessionRef}, Type)
+						SessionRef, NonceFilter}, Type)
 			end)
 			|| N <- lists:seq(1, ThreadCount)],
 	S#state{ hashing_threads = HashingThreads }.
@@ -689,7 +886,9 @@ server(
 		candidate_block = #block{ height = Height },
 		search_space_upper_bound = SearchSpaceUpperBound,
 		blocks_by_timestamp = BlocksByTimestamp,
-		block_index = BI
+		block_index = BI,
+		pool_mine = PoolMine,
+		share_diff = ShareDiff
 	}
 ) ->
 	receive
@@ -711,7 +910,13 @@ server(
 									{h0, ar_util:encode(H0)}, {byte, RecallByte}]),
 							server(S);
 						SPoA ->
-							case validate_spora({BDS, Nonce, Timestamp, Height, B#block.diff,
+							CmpDiff = case PoolMine of
+								true ->
+									ShareDiff;
+								false ->
+									B#block.diff
+							end,
+							case validate_spora({BDS, Nonce, Timestamp, Height, CmpDiff,
 									PrevH, SearchSpaceUpperBound, B#block.packing_2_5_threshold,
 									B#block.strict_data_split_threshold, SPoA, BI}) of
 								{true, _, Hash} ->
@@ -721,8 +926,19 @@ server(
 											hash = Hash,
 											nonce = Nonce
 										},
-									stop_miners(S),
-									process_spora_solution(BDS, B2, MinedTXs, S);
+									case PoolMine of
+										true ->
+											do_nothing;
+										false ->
+											stop_miners(S)
+									end,
+									process_spora_solution(BDS, B2, MinedTXs, S),
+									case PoolMine of
+										true ->
+											server(S);
+										false ->
+											ok
+									end;
 								_ ->
 									?LOG_ERROR([
 										{event, miner_produced_invalid_spora},
@@ -742,7 +958,12 @@ server(
 		%% validated on the remote nodes when it's propagated to them. Only blocks
 		%% with a timestamp close to current time will be accepted in the propagation.
 		refresh_timestamp ->
-			server(notify_hashing_threads(update_data_segment(S)));
+			case PoolMine of
+				true ->
+					server(notify_hashing_threads(update_data_segment_pool(S)));
+				false ->
+					server(notify_hashing_threads(update_data_segment(S)))
+			end;
 		UnexpectedMessage ->
 			?LOG_WARNING(
 				"event: mining_server_got_unexpected_message, message: ~p",
@@ -766,14 +987,22 @@ notify_hashing_threads(S) ->
 		hashing_threads = Threads,
 		candidate_block = #block{ timestamp = Timestamp, diff = Diff },
 		data_segment = BDS,
+		pool_mine = PoolMine,
+		share_diff = ShareDiff,
 		session_ref = SessionRef
 	} = S,
 	{ok, Config} = application:get_env(arweave, config),
 	StageTwoThreadCount = Config#config.stage_two_hashing_threads,
 	StageTwoThreads = lists:sublist(Threads, StageTwoThreadCount),
+	CmpDiff = case PoolMine of
+		true ->
+			ShareDiff;
+		false ->
+			Diff
+	end,
 	lists:foreach(
 		fun(Thread) ->
-			Thread ! {update_state, Timestamp, Diff, BDS, StageTwoThreads, SessionRef}
+			Thread ! {update_state, Timestamp, CmpDiff, BDS, StageTwoThreads, SessionRef}
 		end,
 		Threads
 	),
@@ -859,7 +1088,7 @@ small_weave_hashing_thread(Args) ->
 hashing_thread(S, Type) ->
 	{Parent, PrevH, SearchSpaceUpperBound, PackingThreshold, Height, Timestamp, Diff, BDS,
 			Hasher, StageTwoHasher, StageTwoThreads, IOThreads, HashingIterations, JIT,
-			LargePages, HardwareAES, SessionRef} = S,
+			LargePages, HardwareAES, SessionRef, NonceFilter} = S,
 	T = case Type of stage_one_thread -> 0; stage_two_thread -> 200 end,
 	receive
 		{chunk, H0, Byte, Nonce, Timestamp2, Diff2, Chunk, Entropy, SessionRef}
@@ -882,15 +1111,27 @@ hashing_thread(S, Type) ->
 		{update_state, Timestamp2, Diff2, BDS2, StageTwoThreads2, SessionRef} ->
 			hashing_thread({Parent, PrevH, SearchSpaceUpperBound, PackingThreshold, Height,
 					Timestamp2, Diff2, BDS2, Hasher, StageTwoHasher, StageTwoThreads2,
-					IOThreads, HashingIterations, JIT, LargePages, HardwareAES, SessionRef},
+					IOThreads, HashingIterations, JIT, LargePages, HardwareAES, SessionRef, NonceFilter},
 					Type);
 		_ ->
 			hashing_thread(S, Type)
 	after T ->
 		case Type of
 			stage_one_thread when StageTwoThreads /= [] ->
-				Nonce1 = crypto:strong_rand_bytes(256 div 8),
-				Nonce2 = crypto:strong_rand_bytes(256 div 8),
+				Nonce1 = case NonceFilter of
+					not_used ->
+						crypto:strong_rand_bytes(256 div 8);
+					_ ->
+						B24 = crypto:strong_rand_bytes(24),
+						<< B24/binary, NonceFilter/binary >>
+				end,
+				Nonce2 = case NonceFilter of
+					not_used ->
+						crypto:strong_rand_bytes(256 div 8);
+					_ ->
+						B24_2 = crypto:strong_rand_bytes(24),
+						<< B24_2/binary, NonceFilter/binary >>
+				end,
 				Ref = {Timestamp, Diff, SessionRef},
 				ok = Hasher(Nonce1, Nonce2, BDS, PrevH, SearchSpaceUpperBound, IOThreads,
 						StageTwoThreads, HashingIterations, JIT, LargePages, HardwareAES, Ref),
@@ -900,7 +1141,7 @@ hashing_thread(S, Type) ->
 		end,
 		hashing_thread({Parent, PrevH, SearchSpaceUpperBound, PackingThreshold, Height,
 				Timestamp, Diff, BDS, Hasher, StageTwoHasher, StageTwoThreads, IOThreads,
-				HashingIterations, JIT, LargePages, HardwareAES, SessionRef}, Type)
+				HashingIterations, JIT, LargePages, HardwareAES, SessionRef, NonceFilter}, Type)
 	end.
 
 get_spoa(H0, PrevH, SearchSpaceUpperBound, Height, PackingThreshold) ->
@@ -960,12 +1201,19 @@ log_spora_performance() ->
 
 process_spora_solution(BDS, B, MinedTXs, S) ->
 	#state {
-		current_block = #block{ indep_hash = CurrentBH }
+		current_block = #block{ indep_hash = CurrentBH },
+		pool_mine = PoolMine,
+		pool_mine_parent = Parent
 	} = S,
 	SPoA = B#block.poa,
 	IndepHash = ar_weave:indep_hash(BDS, B#block.hash, B#block.nonce, SPoA),
 	B2 = B#block{ indep_hash = IndepHash },
-	ar_events:send(block, {mined, B2, MinedTXs, CurrentBH}),
+	case PoolMine of
+		true ->
+			Parent ! {work_complete, CurrentBH, B2, MinedTXs, BDS, SPoA};
+		false ->
+			ar_events:send(block, {mined, B2, MinedTXs, CurrentBH})
+	end,
 	log_spora_performance().
 
 prepare_randomx(Height) ->

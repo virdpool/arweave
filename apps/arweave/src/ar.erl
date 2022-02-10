@@ -103,6 +103,7 @@ show_help() ->
 			{"peer (ip:port)", "Join a network on a peer (or set of peers)."},
 			{"start_from_block_index", "Start the node from the latest stored block index."},
 			{"mine", "Automatically start mining once the netwok has been joined."},
+			{"pool_mine", "Alternate mining mode to pool-compatible (mutually exclusive with mine)."},
 			{"port", "The local port to use for mining. "
 						"This port must be accessible by remote peers."},
 			{"data_dir",
@@ -275,7 +276,9 @@ read_config_from_file(Path) ->
 
 parse_cli_args([], C) -> C;
 parse_cli_args(["mine"|Rest], C) ->
-	parse_cli_args(Rest, C#config { mine = true });
+	parse_cli_args(Rest, C#config { mine = true, pool_mine = false });
+parse_cli_args(["pool_mine"|Rest], C) ->
+	parse_cli_args(Rest, C#config { pool_mine = true, mine = false });
 parse_cli_args(["peer", Peer|Rest], C = #config { peers = Ps }) ->
 	case ar_util:safe_parse_peer(Peer) of
 		{ok, ValidPeer} ->
