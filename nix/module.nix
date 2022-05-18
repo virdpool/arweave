@@ -163,13 +163,6 @@ in
       default = 2;
       description = "As semaphore, the max amount of parallel get sync record requests to perform.";
     };
-
-    requestsPerMinuteLimit = mkOption {
-      type = types.int;
-      default = 2500;
-      description = "A rate limiter to prevent the node from receiving too many http requests over 1 minute period.";
-    };
-
   };
 
   config = mkIf cfg.enable (
@@ -197,6 +190,63 @@ in
               arql = 10;
               gateway_arql = 10;
             };
+            requests_per_minute_limit_by_ip = {
+              "54.183.57.78" = {
+                chunk = 24000;
+                data_sync_record = 400;
+                default = 100000;
+              };
+              "54.177.40.45" = {
+                chunk = 24000;
+                data_sync_record = 400;
+                default = 100000;
+              };
+              "13.57.16.17" = {
+                chunk = 24000;
+                data_sync_record = 400;
+                default = 100000;
+              };
+              "52.53.173.102" = {
+                chunk = 24000;
+                data_sync_record = 400;
+                default = 100000;
+              };
+              "52.53.246.130" = {
+                chunk = 24000;
+                data_sync_record = 400;
+                default = 100000;
+              };
+              "54.153.62.148" = {
+                chunk = 24000;
+                data_sync_record = 400;
+                default = 100000;
+              };
+              "52.8.97.93" = {
+                chunk = 24000;
+                data_sync_record = 400;
+                default = 100000;
+              };
+              "3.101.123.11" = {
+                chunk = 24000;
+                data_sync_record = 400;
+                default = 100000;
+              };
+              "204.236.147.90" = {
+                chunk = 24000;
+                data_sync_record = 400;
+                default = 100000;
+              };
+              "54.193.157.88" = {
+                chunk = 24000;
+                data_sync_record = 400;
+                default = 100000;
+              };
+              "54.176.78.79" = {
+                chunk = 24000;
+                data_sync_record = 400;
+                default = 100000;
+              };
+            };
           });
     in {
       systemd.services.arweave = {
@@ -211,7 +261,7 @@ in
           Type = "forking";
           KillMode = "none";
           ExecStartPre = "${pkgs.bash}/bin/bash -c '(${pkgs.procps}/bin/pkill epmd || true) && (${pkgs.procps}/bin/pkill screen || true) && sleep 5 || true'";
-          ExecStart = "${pkgs.screen}/bin/screen -dmS arweave ${cfg.package}/bin/start-nix config_file ${configFile} requests_per_minute_limit ${cfg.requestsPerMinuteLimit} ${builtins.concatStringsSep " " (builtins.concatMap (p: ["peer" p]) cfg.peer)}";
+          ExecStart = "${pkgs.screen}/bin/screen -dmS arweave ${cfg.package}/bin/start-nix config_file ${configFile} ${builtins.concatStringsSep " " (builtins.concatMap (p: ["peer" p]) cfg.peer)}";
           ExecStop = "${pkgs.bash}/bin/bash -c '${pkgs.procps}/bin/pkill beam || true; sleep 15'";
           TimeoutStopSec = 15;
           RestartKillSignal = "SIGINT";
