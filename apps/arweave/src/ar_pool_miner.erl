@@ -101,7 +101,7 @@ start_mining(StateIn) ->
 				Pid ->
 					ar_mine:stop(Pid)
 			end,
-			[{block_index, BI}] = ets:lookup(node_state, block_index),
+			[{recent_block_index, RecentBI}] = ets:lookup(node_state, recent_block_index),
 			[{block_anchors, BlockAnchors}] = ets:lookup(node_state, block_anchors),
 			[{recent_txs_map, RecentTXMap}] = ets:lookup(node_state, recent_txs_map),
 			ar_watchdog:started_hashing(),
@@ -116,7 +116,7 @@ start_mining(StateIn) ->
 				CandidateB#block.txs, % TXs, should be unused
 				SearchSpaceUpperBound,
 				IOThreads,
-				BI,
+				RecentBI,
 				BDSBase,
 				ShareDiff,
 				NonceFilter
