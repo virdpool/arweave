@@ -14,6 +14,8 @@ end).
 -ifdef(DEBUG).
 -define(RPM_BY_PATH(Path, LimitByIP, DefaultPathLimit), fun() ->
 	case Path of
+		[<<"mine">> | _]             -> {mine,             120000};
+		[<<"mine_get_results">> | _] -> {mine_get_results, 120000};
 		[<<"chunk">> | _] ->
 			{chunk,	maps:get(chunk, LimitByIP, 12000)}; % ~50 MB/s.
 		[<<"chunk2">> | _] ->
@@ -29,6 +31,8 @@ end).
 -else.
 -define(RPM_BY_PATH(Path, LimitByIP, DefaultPathLimit), fun() ->
 	case Path of
+		[<<"mine">> | _]             -> {mine,             120000};
+		[<<"mine_get_results">> | _] -> {mine_get_results, 120000};
 		[<<"chunk">> | _] ->
 			{chunk,	maps:get(chunk, LimitByIP, 12000)}; % ~50 MB/s.
 		[<<"chunk2">> | _] ->

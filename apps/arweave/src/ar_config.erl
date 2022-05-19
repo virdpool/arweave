@@ -59,11 +59,18 @@ parse_options([{<<"start_from_block_index">>, Opt} | _], _) ->
 	{error, {bad_type, start_from_block_index, boolean}, Opt};
 
 parse_options([{<<"mine">>, true} | Rest], Config) ->
-	parse_options(Rest, Config#config{ mine = true });
+	parse_options(Rest, Config#config{ mine = true, pool_mine = false });
 parse_options([{<<"mine">>, false} | Rest], Config) ->
 	parse_options(Rest, Config);
 parse_options([{<<"mine">>, Opt} | _], _) ->
 	{error, {bad_type, mine, boolean}, Opt};
+
+parse_options([{<<"pool_mine">>, true} | Rest], Config) ->
+	parse_options(Rest, Config#config{ pool_mine = true, mine = false });
+parse_options([{<<"pool_mine">>, false} | Rest], Config) ->
+	parse_options(Rest, Config);
+parse_options([{<<"pool_mine">>, Opt} | _], _) ->
+	{error, {bad_type, pool_mine, boolean}, Opt};
 
 parse_options([{<<"port">>, Port} | Rest], Config) when is_integer(Port) ->
 	parse_options(Rest, Config#config{ port = Port });

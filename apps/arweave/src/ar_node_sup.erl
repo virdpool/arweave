@@ -27,5 +27,6 @@ start_link() ->
 %% ===================================================================
 init([]) ->
 	{ok, {{one_for_all, 5, 10}, [
-		?CHILD(ar_node_worker, worker)
+		?CHILD(ar_node_worker, worker),
+		?CHILD(ar_pool_miner, worker)
 	]}}.
