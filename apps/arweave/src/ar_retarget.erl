@@ -36,11 +36,11 @@
 
 %% @doc The unconditional difficulty reduction coefficient applied at the
 %% first 2.6 block.
--define(DIFF_DROP_2_6, 1).
+-define(DIFF_DROP_2_6, 4194304).
 
 %% @doc The unconditional difficulty reduction coefficient applied at the
 %% first 2.7 block.
--define(DIFF_DROP_2_7, 2). % TODO
+-define(DIFF_DROP_2_7, 1).
 
 %%%===================================================================
 %%% Public interface.
