@@ -315,7 +315,8 @@
 -ifdef(DEBUG).
 -define(PACKING_2_6_THRESHOLD_CHUNKS_PER_SECOND, 1).
 -else.
--define(PACKING_2_6_THRESHOLD_CHUNKS_PER_SECOND, 40). % ~ 2 months to pack 50 TiB of data.
+%% F = fun(X) -> P = 262144 * X * 120, F = (72 * 1024 * 1024 * 1024 * 1024) div P + 1, ((F - 1)div 10 + 1) * 10 end.
+-define(PACKING_2_6_THRESHOLD_CHUNKS_PER_SECOND, 16000). % 160 2.6 blocks.
 -endif.
 
 %% The data_root of the system "padding" nodes inserted in the transaction Merkle trees
