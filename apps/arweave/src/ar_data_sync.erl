@@ -330,11 +330,21 @@ handle_cast({join, RecentBI, Packing_2_5_Threshold, Packing_2_6_Threshold}, Stat
 	#sync_data_state{ block_index = CurrentBI, weave_size = CurrentWeaveSize,
 			store_id = StoreID } = State,
 	[{_, WeaveSize, _} | _] = RecentBI,
+	{ok, Config} = application:get_env(arweave, config),
+	Reset = lists:member(reset, Config#config.enable),
 	case {CurrentBI, ar_block_index:get_intersection(CurrentBI)} of
 		{[], _} ->
 			ok;
 		{_, {_, CurrentWeaveSize, _}} ->
 			ok;
+		{_, no_intersection} when Reset	->
+			[{_, Offset, _} | _] = RecentBI,
+			PreviousWeaveSize = element(2, hd(CurrentBI)),
+			{ok, OrphanedDataRoots} = remove_orphaned_data(State, Offset, PreviousWeaveSize),
+			ar_chunk_storage:cut(Offset, StoreID),
+			ar_sync_record:cut(Offset, ?MODULE, StoreID),
+			ar_events:send(data_sync, {cut, Offset}),
+			reset_orphaned_data_roots_disk_pool_timestamps(OrphanedDataRoots);
 		{_, no_intersection} ->
 			throw(last_stored_block_index_has_no_intersection_with_the_new_one);
 		{_, {_H, Offset, _TXRoot}} ->
