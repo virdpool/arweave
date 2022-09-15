@@ -20,7 +20,7 @@
 -ifdef(DEBUG).
 -define(PACKING_2_6_THRESHOLD_START, (1024 * 1024)).
 -else.
--define(PACKING_2_6_THRESHOLD_START, (72 * 1024 * 1024 * 1024 * 1024)).
+-define(PACKING_2_6_THRESHOLD_START, 99889117176054). % (72 * 1024 * 1024 * 1024 * 1024)).
 -endif.
 
 %% The size of a recall range. The first range is randomly chosen from the given
