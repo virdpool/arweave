@@ -79,7 +79,7 @@ end).
 	},
 	case Forks of
 		{_Fork_1_9, _Fork_2_2, _Fork_2_5, _Fork_2_6, Fork_2_7} when Height >= Fork_2_7 ->
-			32; % TODO
+			10;
 		{_Fork_1_9, _Fork_2_2, _Fork_2_5, Fork_2_6, _Fork_2_7} when Height >= Fork_2_6 ->
 			32;
 		{_Fork_1_9, _Fork_2_2, Fork_2_5, _Fork_2_6, _Fork_2_7} when Height >= Fork_2_5 ->
