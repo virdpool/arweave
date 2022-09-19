@@ -87,7 +87,7 @@ height_2_6() ->
 	0.
 -else.
 height_2_6() ->
-	1017040. % infinity.
+	1019630. % 1017040. % infinity.
 -endif.
 
 -ifdef(FORKS_RESET).
