@@ -12,10 +12,8 @@
 
 -export([
 	start_link/0,
-	add_tx/1, move_tx_to_mining_pool/1, add_block/4,
-	add_remote_peer/1, add_local_peer/1,
-	get_remote_peers/0, set_remote_peers/1,
-	drop_waiting_txs/1
+	add_remote_peer/1,
+	get_remote_peers/0, get_remote_peers/1, set_remote_peers/1
 ]).
 
 -export([
@@ -32,7 +30,6 @@
 
 %% Internal state definition.
 -record(state, {
-	gossip,				% The internal gossip state.
 	external_peers,		% External peers ordered by best to worst.
 	updater = undefined	% Spawned process for updating peer list.
 }).
@@ -40,18 +37,6 @@
 %%%===================================================================
 %%% API
 %%%===================================================================
-
-%% @doc Notify the bridge of a new external transaction.
-add_tx(TX) ->
-	gen_server:cast(?MODULE, {add_tx, TX}).
-
-%% @doc Notify the bridge of a transaction ready to be mined.
-move_tx_to_mining_pool(TX) ->
-	gen_server:cast(?MODULE, {move_tx_to_mining_pool, TX}).
-
-%% @doc Notify the bridge of a new external block.
-add_block(OriginPeer, Block, BDS, ReceiveTimestamp) ->
-	gen_server:cast(?MODULE, {add_block, OriginPeer, Block, BDS, ReceiveTimestamp}).
 
 %% @doc Add a remote HTTP peer.
 add_remote_peer(Node) ->
@@ -61,22 +46,17 @@ add_remote_peer(Node) ->
 			gen_server:cast(?MODULE, {add_peer, remote, Node})
 	end.
 
-%% @doc Add a local gossip peer.
-add_local_peer(Node) ->
-	gen_server:cast(?MODULE, {add_peer, local, Node}).
+%% @doc Get a list of remote peers.
+get_remote_peers(Timeout) ->
+	gen_server:call(?MODULE, {get_peers, remote}, Timeout).
 
-%% @doc Get a list of remote peers
+%% @doc Get a list of remote peers.
 get_remote_peers() ->
-	gen_server:call(?MODULE, {get_peers, remote}).
+	gen_server:call(?MODULE, {get_peers, remote}, 10000).
 
 %% @doc Reset the remote peers list to a specific set.
 set_remote_peers(Peers) ->
 	gen_server:cast(?MODULE, {set_peers, Peers}).
-
-%% @doc Notify the bridge of the dropped transactions from
-%% the awaiting propgation transaction set.
-drop_waiting_txs(TXs) ->
-	gen_server:cast(?MODULE, {drop_waiting_txs, TXs}).
 
 %%--------------------------------------------------------------------
 %% @doc
@@ -105,12 +85,10 @@ start_link() ->
 init([]) ->
 	process_flag(trap_exit, true),
 	{ok, Config} = application:get_env(arweave, config),
-	%% Start the transaction distribution priority queue.
-	ok = ar_tx_queue:start_link(),
 	%% Start asking peers about their peers.
 	erlang:send_after(0, self(), get_more_peers),
+	ar_events:subscribe(block),
 	State = #state {
-		gossip = ar_gossip:init([]),
 		external_peers = Config#config.peers
 	},
 	{ok, State}.
@@ -147,30 +125,6 @@ handle_call(Request, _From, State) ->
 %% @end
 %%--------------------------------------------------------------------
 
-%% Send the transaction to internal processes.
-handle_cast({add_tx, TX}, State) ->
-	#state{ gossip = GS } = State,
-	Msg = {add_waiting_tx, TX},
-	{NewGS, _} = ar_gossip:send(GS, Msg),
-	ar_tx_queue:add_tx(TX),
-	ar_ignore_registry:add(TX#tx.id),
-	{noreply, State#state { gossip = NewGS }};
-
-handle_cast({move_tx_to_mining_pool, _TX} = Msg, State) ->
-	#state { gossip = GS } = State,
-	{NewGS, _} = ar_gossip:send(GS, Msg),
-	{noreply, State#state { gossip = NewGS }};
-
-handle_cast({add_block, OriginPeer, B, BDS, ReceiveTimestamp}, State) ->
-	#state {
-		gossip = GS,
-		external_peers = ExternalPeers
-	} = State,
-	Msg = {new_block, OriginPeer, B#block.height, B, BDS, ReceiveTimestamp},
-	{NewGS, _} = ar_gossip:send(GS, Msg),
-	send_block_to_external(ExternalPeers, B, BDS),
-	{noreply, State#state { gossip = NewGS }};
-
 handle_cast({add_peer, remote, Peer}, State) ->
 	#state{ external_peers = ExtPeers } = State,
 	case {lists:member(Peer, ?PEER_PERMANENT_BLACKLIST), lists:member(Peer, ExtPeers)} of
@@ -182,19 +136,9 @@ handle_cast({add_peer, remote, Peer}, State) ->
 			{noreply, State#state{ external_peers = ExtPeers ++ [Peer] }}
 	end;
 
-handle_cast({add_peer, local, Peer}, State) ->
-	#state{ gossip = GS0 } = State,
-	GS1 = ar_gossip:add_peers(GS0, [Peer]),
-	{noreply, State#state{ gossip = GS1}};
-
 handle_cast({set_peers, Peers}, State) ->
 	update_state_metrics(Peers),
 	{noreply, State#state{ external_peers = Peers }};
-
-handle_cast({drop_waiting_txs, _TXs} = Msg, State) ->
-	#state{ gossip = GS } = State,
-	{NewGS, _} = ar_gossip:send(GS, Msg),
-	{noreply, State#state{ gossip = NewGS }};
 
 handle_cast(Msg, State) ->
 	?LOG_ERROR([{event, unhandled_cast}, {module, ?MODULE}, {message, Msg}]),
@@ -210,24 +154,13 @@ handle_cast(Msg, State) ->
 %%									 {stop, Reason, State}
 %% @end
 %%--------------------------------------------------------------------
-
-handle_info(Info, State) when is_record(Info, gs_msg) ->
-	#state{ gossip = GS0 } = State,
-	case ar_gossip:recv(GS0, Info) of
-		{_, ignore} ->
-			{noreply, State};
-		Gossip ->
-			State1 = gossip_to_external(State, Gossip),
-			{noreply, State1}
-	end;
-
 handle_info(get_more_peers, #state{ updater = undefined } = State) ->
 	Self = self(),
 	erlang:send_after(?GET_MORE_PEERS_TIME, Self, get_more_peers),
 	Updater = spawn(
 		fun() ->
 			Peers = ar_manage_peers:update(State#state.external_peers),
-			lists:map(fun ar_http_iface_client:add_peer/1, Peers),
+			ping_peers(Peers),
 			Self ! {update_peers, remote, Peers}
 		end
 	),
@@ -243,6 +176,26 @@ handle_info({update_peers, remote, Peers}, State) ->
 	State2 = State#state{ external_peers = Peers, updater = undefined },
 	{noreply, State2};
 
+handle_info({event, block, {new, _Block, ar_poller}}, State) ->
+	%% ar_poller often fetches blocks when the network already knows about them
+	%% so do not gossip.
+	{noreply, State};
+
+handle_info({event, block, {new, Block, _Source}}, State) ->
+	case ar_block_cache:get(block_cache, Block#block.previous_block) of
+		not_found ->
+			%% The cache should have been just pruned and this block is old.
+			{noreply, State};
+		_ ->
+			spawn(fun() ->
+				send_block_to_external_parallel(State#state.external_peers, Block)
+			end),
+			{noreply, State}
+	end;
+
+handle_info({event, block, {mined, _Block, _TXs, _CurrentBH}}, State) ->
+	%% This event is handled by ar_node_worker. Ignore it.
+	{noreply, State};
 handle_info(Info, State) ->
 	?LOG_ERROR([{event, unhandled_info}, {module, ?MODULE}, {info, Info}]),
 	{noreply, State}.
@@ -295,50 +248,18 @@ is_loopback_ip({255, 255, 255, 255}) -> true;
 is_loopback_ip({_, _, _, _}) -> false.
 -endif.
 
-%% @doc Send an internal message externally.
-send_to_external(S, {new_block, _, _Height, _NewB, no_data_segment, _Timestamp}) ->
-	S;
-send_to_external(S, {new_block, _, _Height, NewB, BDS, _Timestamp}) ->
-	send_block_to_external(
-		S#state.external_peers,
-		NewB,
-		BDS
-	),
-	S;
-send_to_external(S, {add_tx, _TX}) ->
-	%% The message originates from the internal network, do not gossip.
-	S;
-send_to_external(S, {NewGS, Msg}) ->
-	send_to_external(S#state { gossip = NewGS }, Msg).
-
-%% @doc Send a block to external peers in a spawned process.
-send_block_to_external(ExternalPeers, B, BDS) ->
-	spawn(fun() ->
-		send_block_to_external_parallel(ExternalPeers, B, BDS)
-	end).
-
-%% @doc Send the new block to the peers by first sending it in parallel to the
-%% best/first peers and then continuing sequentially with the rest of the peers
-%% in order.
-send_block_to_external_parallel(Peers, NewB, BDS) ->
-	{PeersParallel, PeersRest} = lists:split(
-		min(length(Peers), ?BLOCK_PROPAGATION_PARALLELIZATION),
-		Peers
-	),
-	NSeqPeers =
-		max(0, ar_meta_db:get(max_propagation_peers) - ?BLOCK_PROPAGATION_PARALLELIZATION),
-	PeersSequential = lists:sublist(PeersRest, NSeqPeers),
-	?LOG_INFO(
-		[
-			{sending_block_to_external_peers, ar_util:encode(NewB#block.indep_hash)},
-			{peers, length(PeersParallel) + length(PeersSequential)}
-		]
-	),
-	Send = fun(Peer) ->
-		ar_http_iface_client:send_new_block(Peer, NewB, BDS)
-	end,
+%% @doc Send the new block to #config.max_block_propagation_peers peers,
+%% ?BLOCK_PROPAGATION_PARALLELIZATION peers at a time. The peers
+%% are chosen using ar_tx_emitter:pick_peers/2.
+send_block_to_external_parallel(Peers, B) ->
+	{ok, Config} = application:get_env(arweave, config),
+	TrustedPeers = Config#config.peers,
+	PickedPeers = (ar_tx_emitter:pick_peers(Peers, Config#config.max_block_propagation_peers)
+			-- TrustedPeers) ++ TrustedPeers,
+	BDS = ar_block:generate_block_data_segment(B),
+	Send = fun(Peer) -> ar_http_iface_client:send_new_block(Peer, B, BDS) end,
 	SendRetry = fun(Peer) ->
-		case ar_http_iface_client:send_new_block(Peer, NewB, BDS) of
+		case ar_http_iface_client:send_new_block(Peer, B, BDS) of
 			{ok, {{<<"412">>, _}, _, _, _, _}} ->
 				timer:sleep(5000),
 				Send(Peer);
@@ -346,12 +267,25 @@ send_block_to_external_parallel(Peers, NewB, BDS) ->
 				ok
 		end
 	end,
-	ar_util:pmap(SendRetry, PeersParallel),
-	lists:foreach(Send, PeersSequential).
+	EncodedBH = ar_util:encode(B#block.indep_hash),
+	PeerLen = length(PickedPeers),
+	?LOG_INFO([{event, sending_block_to_external_peers}, {block, EncodedBH}, {peers, PeerLen}]),
+	send_block_to_external_parallel(PickedPeers, SendRetry, ?BLOCK_PROPAGATION_PARALLELIZATION),
+	?LOG_INFO([{event, sent_block_to_external_peers}, {block, EncodedBH}, {peers, PeerLen}]).
 
-%% @doc Possibly send a new message to external peers.
-gossip_to_external(S, {NewGS, Msg}) ->
-	send_to_external(S#state { gossip = NewGS }, Msg).
+send_block_to_external_parallel(Peers, SendFun, ThreadCount) when length(Peers) < ThreadCount ->
+	ar_util:pmap(SendFun, Peers);
+send_block_to_external_parallel(Peers, SendFun, ThreadCount) ->
+	{Chunk, Peers2} = lists:split(ThreadCount, Peers),
+	ar_util:pmap(SendFun, Chunk),
+	send_block_to_external_parallel(Peers2, SendFun, ThreadCount).
+
+ping_peers(Peers) when length(Peers) < 10 ->
+	ar_util:pmap(fun ar_http_iface_client:add_peer/1, Peers);
+ping_peers(Peers) ->
+	{Send, Rest} = lists:split(10, Peers),
+	ar_util:pmap(fun ar_http_iface_client:add_peer/1, Send),
+	ping_peers(Rest).
 
 update_state_metrics(Peers) when is_list(Peers) ->
 	prometheus_gauge:set(arweave_peer_count, length(Peers));

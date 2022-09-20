@@ -5,8 +5,10 @@
 -export([execute/2]).
 
 -include_lib("arweave/include/ar.hrl").
+-include_lib("arweave/include/ar_config.hrl").
 -include_lib("arweave/include/ar_pricing.hrl").
 -include_lib("arweave/include/ar_data_sync.hrl").
+-include_lib("arweave/include/ar_data_discovery.hrl").
 -include_lib("arweave/include/ar_mine.hrl").
 
 -define(HANDLER_TIMEOUT, 55000).
@@ -155,17 +157,12 @@ handle(<<"GET">>, [<<"tx">>, <<"pending">>], Req, _Pid) ->
 
 %% Return outgoing transaction priority queue.
 %% GET request to endpoint /queue.
+%% @deprecated
 handle(<<"GET">>, [<<"queue">>], Req, _Pid) ->
-	{200, #{}, ar_serialize:jsonify(
-		lists:map(
-			fun({TXID, Reward, Size}) ->
-				{[{tx, TXID}, {reward, Reward}, {size, Size}]}
-			end,
-			ar_tx_queue:show_queue())),
-	Req};
+	{200, #{}, <<"[]">>, Req};
 
 %% Return additional information about the transaction with the given identifier (hash).
-%% GET request to endpoint /tx/{hash}.
+%% GET request to endpoint /tx/{hash}/status.
 handle(<<"GET">>, [<<"tx">>, Hash, <<"status">>], Req, _Pid) ->
 	ar_semaphore:acquire(arql_semaphore(Req), 5000),
 	case ar_node:is_joined() of
@@ -178,19 +175,33 @@ handle(<<"GET">>, [<<"tx">>, Hash, <<"status">>], Req, _Pid) ->
 %% Return a transaction specified via the the transaction id (hash).
 %% GET request to endpoint /tx/{hash}.
 handle(<<"GET">>, [<<"tx">>, Hash], Req, _Pid) ->
-	case get_tx_filename(Hash) of
-		{ok, Filename} ->
-			{200, #{}, sendfile(Filename), Req};
-		{migrated_v1, Filename} ->
-			case ar_storage:read_migrated_v1_tx_file(Filename) of
-				{ok, TX} ->
+	case ar_util:safe_decode(Hash) of
+		{error, invalid} ->
+			{400, #{}, <<"Invalid hash.">>, Req};
+		{ok, ID} ->
+			case ar_storage:read_tx(ID) of
+				unavailable ->
+					maybe_tx_is_pending_response(ID, Req);
+				#tx{} = TX ->
+					Body = ar_serialize:jsonify(ar_serialize:tx_to_json_struct(TX)),
+					{200, #{}, Body, Req}
+			end
+	end;
+
+%% Return a possibly unconfirmed transaction.
+%% GET request to endpoint /unconfirmed_tx/{hash}.
+handle(<<"GET">>, [<<"unconfirmed_tx">>, Hash], Req, Pid) ->
+	case ar_util:safe_decode(Hash) of
+		{error, invalid} ->
+			{400, #{}, <<"Invalid hash.">>, Req};
+		{ok, TXID} ->
+			case ets:lookup(node_state, {tx, TXID}) of
+				[{_, TX}] ->
 					Body = ar_serialize:jsonify(ar_serialize:tx_to_json_struct(TX)),
 					{200, #{}, Body, Req};
-				_ ->
-					{404, #{}, <<>>, Req}
-			end;
-		{response, {Status, Headers, Body}} ->
-			{Status, Headers, Body, Req}
+				[] ->
+					handle(<<"GET">>, [<<"tx">>, Hash], Req, Pid)
+			end
 	end;
 
 %% Return the transaction IDs of all txs where the tags in post match the given set
@@ -204,32 +215,38 @@ handle(<<"GET">>, [<<"tx">>, Hash], Req, _Pid) ->
 %%		expr2:	{ string | logical expression }
 %%	}
 handle(<<"POST">>, [<<"arql">>], Req, Pid) ->
-	ar_semaphore:acquire(arql_semaphore(Req), 5000),
-	case ar_node:is_joined() of
-		false ->
-			not_joined(Req);
+	{ok, Config} = application:get_env(arweave, config),
+	case lists:member(serve_arql, Config#config.enable) of
 		true ->
-			case read_complete_body(Req, Pid) of
-				{ok, QueryJSON, Req2} ->
-					case ar_serialize:json_struct_to_query(QueryJSON) of
-						{ok, Query} ->
-							case catch ar_arql_db:eval_legacy_arql(Query) of
-								EncodedTXIDs when is_list(EncodedTXIDs) ->
-									Body = ar_serialize:jsonify(EncodedTXIDs),
-									{200, #{}, Body, Req2};
-								bad_query ->
-									{400, #{}, <<"Invalid query.">>, Req2};
-								sqlite_parser_stack_overflow ->
-									{400, #{}, <<"The query nesting depth is too big.">>, Req2};
-								{'EXIT', {timeout, {gen_server, call, [ar_arql_db, _]}}} ->
-									{503, #{}, <<"ArQL unavailable.">>, Req2}
+			ar_semaphore:acquire(arql_semaphore(Req), 5000),
+			case ar_node:is_joined() of
+				false ->
+					not_joined(Req);
+				true ->
+					case read_complete_body(Req, Pid) of
+						{ok, QueryJSON, Req2} ->
+							case ar_serialize:json_struct_to_query(QueryJSON) of
+								{ok, Query} ->
+									case catch ar_arql_db:eval_legacy_arql(Query) of
+										EncodedTXIDs when is_list(EncodedTXIDs) ->
+											Body = ar_serialize:jsonify(EncodedTXIDs),
+											{200, #{}, Body, Req2};
+										bad_query ->
+											{400, #{}, <<"Invalid query.">>, Req2};
+										sqlite_parser_stack_overflow ->
+											{400, #{}, <<"The query nesting depth is too big.">>, Req2};
+										{'EXIT', {timeout, {gen_server, call, [ar_arql_db, _]}}} ->
+											{503, #{}, <<"ArQL unavailable.">>, Req2}
+									end;
+								{error, _} ->
+									{400, #{}, <<"Invalid ARQL query.">>, Req2}
 							end;
-						{error, _} ->
-							{400, #{}, <<"Invalid ARQL query.">>, Req2}
-					end;
-				{error, body_size_too_large} ->
-					{413, #{}, <<"Payload too large">>, Req}
-			end
+						{error, body_size_too_large} ->
+							{413, #{}, <<"Payload too large">>, Req}
+					end
+			end;
+		false ->
+			{421, #{}, jiffy:encode(#{ error => endpoint_not_enabled }), Req}
 	end;
 
 %% Return the data field of the transaction specified via the transaction ID (hash)
@@ -240,23 +257,32 @@ handle(<<"GET">>, [<<"tx">>, Hash, << "data.", _/binary >>], Req, _Pid) ->
 		false ->
 			{421, #{}, <<"Serving HTML data is disabled on this node.">>, Req};
 		_ ->
-			case hash_to_filename(tx, Hash) of
+			case ar_util:safe_decode(Hash) of
 				{error, invalid} ->
 					{400, #{}, <<"Invalid hash.">>, Req};
-				{error, _, unavailable} ->
-					{404, #{}, sendfile("data/not_found.html"), Req};
-				{ok, Filename} ->
-					{ok, TX} = ar_storage:read_tx_file(Filename),
-					serve_tx_html_data(Req, TX);
-				{migrated_v1, Filename} ->
-					case ar_storage:read_migrated_v1_tx_file(Filename) of
-						{ok, TX} ->
-							serve_tx_html_data(Req, TX);
-						{error, data_unavailable} ->
-							{404, #{}, <<>>, Req};
-						_ ->
-							{500, #{}, <<>>, Req}
+				{ok, ID} ->
+					case ar_storage:read_tx(ID) of
+						unavailable ->
+							{404, #{}, sendfile("data/not_found.html"), Req};
+						#tx{} = TX ->
+							serve_tx_html_data(Req, TX)
 					end
+			end
+	end;
+
+handle(<<"GET">>, [<<"sync_buckets">>], Req, _Pid) ->
+	case ar_node:is_joined() of
+		false ->
+			not_joined(Req);
+		true ->
+			ok = ar_semaphore:acquire(get_sync_record, infinity),
+			case ar_sync_record:get_serialized_sync_buckets(ar_data_sync) of
+				{ok, Binary} ->
+					{200, #{}, Binary, Req};
+				{error, not_initialized} ->
+					{500, #{}, jiffy:encode(#{ error => not_initialized }), Req};
+				{error, timeout} ->
+					{503, #{}, jiffy:encode(#{ error => timeout }), Req}
 			end
 	end;
 
@@ -272,7 +298,9 @@ handle(<<"GET">>, [<<"data_sync_record">>], Req, _Pid) ->
 					_ ->
 						etf
 			end,
-			case ar_data_sync:get_sync_record(#{ format => Format, random_subset => true }) of
+			ok = ar_semaphore:acquire(get_sync_record, infinity),
+			Options = #{ format => Format, random_subset => true },
+			case ar_sync_record:get_record(Options, ar_data_sync) of
 				{ok, Binary} ->
 					{200, #{}, Binary, Req};
 				{error, timeout} ->
@@ -293,28 +321,71 @@ handle(<<"GET">>, [<<"data_sync_record">>, EncodedStart, EncodedLimit], Req, _Pi
 						true ->
 							{400, #{}, jiffy:encode(#{ error => limit_too_big }), Req};
 						false ->
+							ok = ar_semaphore:acquire(get_sync_record, infinity),
 							handle_get_data_sync_record(Start, Limit, Req)
 					end
 			end
 	end;
 
 handle(<<"GET">>, [<<"chunk">>, OffsetBinary], Req, _Pid) ->
-	ok = ar_semaphore:acquire(get_chunk_semaphore, infinity),
 	case catch binary_to_integer(OffsetBinary) of
 		Offset when is_integer(Offset) ->
 			case << Offset:(?NOTE_SIZE * 8) >> of
 				%% A positive number represented by =< ?NOTE_SIZE bytes.
 				<< Offset:(?NOTE_SIZE * 8) >> ->
-					case ar_data_sync:get_chunk(Offset) of
-						{ok, Proof} ->
-							Reply = jiffy:encode(ar_serialize:chunk_proof_to_json_map(Proof)),
-							{200, #{}, Reply, Req};
-						{error, chunk_not_found} ->
-							{404, #{}, <<>>, Req};
-						{error, not_joined} ->
-							not_joined(Req);
-						{error, failed_to_read_chunk} ->
-							{500, #{}, <<>>, Req}
+					RequestedPacking =
+						case cowboy_req:header(<<"x-packing">>, Req, not_set) of
+							not_set ->
+								unpacked;
+							<<"unpacked">> ->
+								unpacked;
+							<<"spora_2_5">> ->
+								spora_2_5;
+							_ ->
+								any
+						end,
+					IsBucketBasedOffset =
+						case cowboy_req:header(<<"x-bucket-based-offset">>, Req, not_set) of
+							not_set ->
+								false;
+							_ ->
+								true
+						end,
+					{ReadPacking, CheckRecords} =
+						case ar_sync_record:is_recorded(Offset, ar_data_sync) of
+							false ->
+								{none, {reply, {404, #{}, <<>>, Req}}};
+							{true, RequestedPacking} ->
+								ok = ar_semaphore:acquire(get_chunk, infinity),
+								{RequestedPacking, ok};
+							{true, Packing} when RequestedPacking == any ->
+								ok = ar_semaphore:acquire(get_chunk, infinity),
+								{Packing, ok};
+							{true, _} ->
+								ok = ar_semaphore:acquire(get_and_pack_chunk, infinity),
+								{RequestedPacking, ok}
+						end,
+					case CheckRecords of
+						{reply, Reply} ->
+							Reply;
+						ok ->
+							Args = #{ packing => ReadPacking,
+									bucket_based_offset => IsBucketBasedOffset },
+							case ar_data_sync:get_chunk(Offset, Args) of
+								{ok, Proof} ->
+									Proof2 = Proof#{ packing => ReadPacking },
+									Reply =
+										jiffy:encode(
+											ar_serialize:chunk_proof_to_json_map(Proof2)
+										),
+									{200, #{}, Reply, Req};
+								{error, chunk_not_found} ->
+									{404, #{}, <<>>, Req};
+								{error, not_joined} ->
+									not_joined(Req);
+								{error, failed_to_read_chunk} ->
+									{500, #{}, <<>>, Req}
+							end
 					end;
 				_ ->
 					{400, #{}, jiffy:encode(#{ error => offset_out_of_bounds }), Req}
@@ -354,23 +425,57 @@ handle(<<"POST">>, [<<"chunk">>], Req, Pid) ->
 		false ->
 			not_joined(Req);
 		true ->
-			ok = ar_semaphore:acquire(post_chunk_semaphore, 200),
-			case read_complete_body(Req, Pid, ?MAX_SERIALIZED_CHUNK_PROOF_SIZE) of
-				{ok, Body, Req2} ->
-					case ar_serialize:json_decode(Body, [{return_maps, true}]) of
-						{ok, JSON} ->
-							case catch ar_serialize:json_map_to_chunk_proof(JSON) of
-								{'EXIT', _} ->
-									{400, #{}, jiffy:encode(#{ error => invalid_json }), Req2};
-								Proof ->
-									handle_post_chunk(Proof, Req2)
+			ok = ar_semaphore:acquire(post_chunk, infinity),
+			case check_if_chunk_data_root_exists(Req) of
+				{reply, Reply} ->
+					Reply;
+				continue ->
+					case read_complete_body(Req, Pid, ?MAX_SERIALIZED_CHUNK_PROOF_SIZE) of
+						{ok, Body, Req2} ->
+							case ar_serialize:json_decode(Body, [{return_maps, true}]) of
+								{ok, JSON} ->
+									case catch ar_serialize:json_map_to_chunk_proof(JSON) of
+										{'EXIT', _} ->
+											{400, #{},
+												jiffy:encode(#{ error => invalid_json }), Req2};
+										Proof ->
+											handle_post_chunk(Proof, Req2)
+									end;
+								{error, _} ->
+									{400, #{}, jiffy:encode(#{ error => invalid_json }), Req2}
 							end;
+						{error, body_size_too_large} ->
+							{413, #{}, <<"Payload too large">>, Req}
+					end
+			end
+	end;
+
+handle(<<"POST">>, [<<"mine">>], Req, Pid) ->
+	case check_internal_api_secret(Req) of
+		pass ->
+			case read_complete_body(Req, Pid) of
+				{ok, Body, _} ->
+					case ar_serialize:json_decode(Body, [{return_maps, true}]) of
+						{ok, MineJSON} ->
+							ar_pool_miner:start(MineJSON),
+							{200, #{}, <<"{}">>, Req};
 						{error, _} ->
-							{400, #{}, jiffy:encode(#{ error => invalid_json }), Req2}
+							{400, #{}, jiffy:encode(#{ error => invalid_json }), Req}
 					end;
 				{error, body_size_too_large} ->
 					{413, #{}, <<"Payload too large">>, Req}
-			end
+			end;
+		{reject, {Status, Headers, Body}} ->
+			{Status, Headers, Body, Req}
+	end;
+
+handle(<<"GET">>, [<<"mine_get_results">>], Req, _Pid) ->
+	case check_internal_api_secret(Req) of
+		pass ->
+			CompleteJobList = ar_pool_miner:get_results(),
+			{200, #{}, jiffy:encode(#{ finished_job_list => CompleteJobList}), Req};
+		{reject, {Status, Headers, Body}} ->
+			{Status, Headers, Body, Req}
 	end;
 
 %% Share a new block to a peer.
@@ -407,15 +512,15 @@ handle(<<"POST">>, [<<"tx">>], Req, Pid) ->
 			case post_tx_parse_id({Req, Pid}) of
 				{error, invalid_hash, Req2} ->
 					{400, #{}, <<"Invalid hash.">>, Req2};
-				{error, tx_already_processed, Req2} ->
+				{error, tx_already_processed, _TXID, Req2} ->
 					{208, #{}, <<"Transaction already processed.">>, Req2};
 				{error, invalid_json, Req2} ->
 					{400, #{}, <<"Invalid JSON.">>, Req2};
 				{error, body_size_too_large, Req2} ->
 					{413, #{}, <<"Payload too large">>, Req2};
 				{ok, TX} ->
-					{PeerIP, _Port} = cowboy_req:peer(Req),
-					case handle_post_tx(Req, PeerIP, TX) of
+					Peer = ar_http_util:arweave_peer(Req),
+					case handle_post_tx(Req, Peer, TX) of
 						ok ->
 							{200, #{}, <<"OK">>, Req};
 						{error_response, {Status, Headers, Body}} ->
@@ -467,9 +572,9 @@ handle(<<"POST">>, [<<"unsigned_tx">>], Req, Pid) ->
 						data_root = DataRoot
 					},
 					SignedTX = ar_tx:sign(Format2TX, KeyPair),
-					{PeerIP, _Port} = cowboy_req:peer(Req),
+					Peer = ar_http_util:arweave_peer(Req),
 					Reply = ar_serialize:jsonify({[{<<"id">>, ar_util:encode(SignedTX#tx.id)}]}),
-					case handle_post_tx(Req2, PeerIP, SignedTX) of
+					case handle_post_tx(Req2, Peer, SignedTX) of
 						ok ->
 							{200, #{}, Reply, Req2};
 						{error_response, {Status, Headers, ErrBody}} ->
@@ -491,7 +596,8 @@ handle(<<"GET">>, [<<"peers">>], Req, _Pid) ->
 				list_to_binary(ar_util:format_peer(P))
 			||
 				P <- ar_bridge:get_remote_peers(),
-				P /= ar_http_util:arweave_peer(Req)
+				P /= ar_http_util:arweave_peer(Req),
+				ar_manage_peers:is_public_peer(P)
 			]
 		),
 	Req};
@@ -519,7 +625,7 @@ handle(<<"GET">>, [<<"price">>, SizeInBytesBinary, Addr], Req, _Pid) ->
 		false ->
 			not_joined(Req);
 		true ->
-			case ar_util:safe_decode(Addr) of
+			case ar_wallet:base64_address_with_optional_checksum_to_decoded_address_safe(Addr) of
 				{error, invalid} ->
 					{400, #{}, <<"Invalid address.">>, Req};
 				{ok, AddrOK} ->
@@ -539,7 +645,7 @@ handle(<<"GET">>, [<<"hash_list">>], Req, _Pid) ->
 	handle(<<"GET">>, [<<"block_index">>], Req, _Pid);
 
 handle(<<"GET">>, [<<"block_index">>], Req, _Pid) ->
-	ok = ar_semaphore:acquire(block_index_semaphore, infinity),
+	ok = ar_semaphore:acquire(get_block_index, infinity),
 	case ar_node:is_joined() of
 		false ->
 			not_joined(Req);
@@ -560,7 +666,7 @@ handle(<<"GET">>, [<<"wallet_list">>], Req, _Pid) ->
 			not_joined(Req);
 		true ->
 			H = ar_node:get_current_block_hash(),
-			process_request(get_block, [<<"hash">>, H, <<"wallet_list">>], Req)
+			process_request(get_block, [<<"hash">>, ar_util:encode(H), <<"wallet_list">>], Req)
 	end;
 
 %% Return a bunch of wallets, up to ?WALLET_LIST_CHUNK_SIZE, from the tree with
@@ -619,7 +725,7 @@ handle(<<"GET">>, [<<"wallet">>, Addr, <<"balance">>], Req, _Pid) ->
 		false ->
 			not_joined(Req);
 		true ->
-			case ar_util:safe_decode(Addr) of
+			case ar_wallet:base64_address_with_optional_checksum_to_decoded_address_safe(Addr) of
 				{error, invalid} ->
 					{400, #{}, <<"Invalid address.">>, Req};
 				{ok, AddrOK} ->
@@ -642,7 +748,7 @@ handle(<<"GET">>, [<<"wallet">>, Addr, <<"last_tx">>], Req, _Pid) ->
 		false ->
 			not_joined(Req);
 		true ->
-			case ar_util:safe_decode(Addr) of
+			case ar_wallet:base64_address_with_optional_checksum_to_decoded_address_safe(Addr) of
 				{error, invalid} ->
 					{400, #{}, <<"Invalid address.">>, Req};
 				{ok, AddrOK} ->
@@ -669,116 +775,143 @@ handle(<<"GET">>, [<<"tx_anchor">>], Req, _Pid) ->
 %% Return transaction identifiers (hashes) for the wallet specified via wallet_address.
 %% GET request to endpoint /wallet/{wallet_address}/txs.
 handle(<<"GET">>, [<<"wallet">>, Addr, <<"txs">>], Req, _Pid) ->
-	ar_semaphore:acquire(arql_semaphore(Req), 5000),
-	{Status, Headers, Body} = handle_get_wallet_txs(Addr, none),
-	{Status, Headers, Body, Req};
+	{ok, Config} = application:get_env(arweave, config),
+	case lists:member(serve_wallet_txs, Config#config.enable) of
+		true ->
+			ar_semaphore:acquire(arql_semaphore(Req), 5000),
+			{Status, Headers, Body} = handle_get_wallet_txs(Addr, none),
+			{Status, Headers, Body, Req};
+		false ->
+			{421, #{}, jiffy:encode(#{ error => endpoint_not_enabled }), Req}
+	end;
 
 %% Return transaction identifiers (hashes) starting from the earliest_tx for the wallet
 %% specified via wallet_address.
 %% GET request to endpoint /wallet/{wallet_address}/txs/{earliest_tx}.
 handle(<<"GET">>, [<<"wallet">>, Addr, <<"txs">>, EarliestTX], Req, _Pid) ->
-	ar_semaphore:acquire(arql_semaphore(Req), 5000),
-	{Status, Headers, Body} = handle_get_wallet_txs(Addr, ar_util:decode(EarliestTX)),
-	{Status, Headers, Body, Req};
+	{ok, Config} = application:get_env(arweave, config),
+	case lists:member(serve_wallet_txs, Config#config.enable) of
+		true ->
+			ar_semaphore:acquire(arql_semaphore(Req), 5000),
+			{Status, Headers, Body} = handle_get_wallet_txs(Addr, ar_util:decode(EarliestTX)),
+			{Status, Headers, Body, Req};
+		false ->
+			{421, #{}, jiffy:encode(#{ error => endpoint_not_enabled }), Req}
+	end;
 
 %% Return identifiers (hashes) of transfer transactions depositing to the given
 %% wallet_address.
 %% GET request to endpoint /wallet/{wallet_address}/deposits.
 handle(<<"GET">>, [<<"wallet">>, Addr, <<"deposits">>], Req, _Pid) ->
-	ar_semaphore:acquire(arql_semaphore(Req), 5000),
-	case catch ar_arql_db:select_txs_by([{to, [Addr]}]) of
-		TXMaps when is_list(TXMaps) ->
-			TXIDs = lists:map(fun(#{ id := ID }) -> ID end, TXMaps),
-			{200, #{}, ar_serialize:jsonify(TXIDs), Req};
-		{'EXIT', {timeout, {gen_server, call, [ar_arql_db, _]}}} ->
-			{503, #{}, <<"ArQL unavailable.">>, Req}
+	{ok, Config} = application:get_env(arweave, config),
+	case lists:member(serve_wallet_deposits, Config#config.enable) of
+		true ->
+			ar_semaphore:acquire(arql_semaphore(Req), 5000),
+			case catch ar_arql_db:select_txs_by([{to, [Addr]}]) of
+				TXMaps when is_list(TXMaps) ->
+					TXIDs = lists:map(fun(#{ id := ID }) -> ID end, TXMaps),
+					{200, #{}, ar_serialize:jsonify(TXIDs), Req};
+				{'EXIT', {timeout, {gen_server, call, [ar_arql_db, _]}}} ->
+					{503, #{}, <<"ArQL unavailable.">>, Req}
+			end;
+		false ->
+			{421, #{}, jiffy:encode(#{ error => endpoint_not_enabled }), Req}
 	end;
 
 %% Return identifiers (hashes) of transfer transactions depositing to the given
 %% wallet_address starting from the earliest_deposit.
 %% GET request to endpoint /wallet/{wallet_address}/deposits/{earliest_deposit}.
 handle(<<"GET">>, [<<"wallet">>, Addr, <<"deposits">>, EarliestDeposit], Req, _Pid) ->
-	ar_semaphore:acquire(arql_semaphore(Req), 5000),
-	case catch ar_arql_db:select_txs_by([{to, [Addr]}]) of
-		TXMaps when is_list(TXMaps) ->
-			TXIDs = lists:map(fun(#{ id := ID }) -> ID end, TXMaps),
-			{Before, After} = lists:splitwith(fun(T) -> T /= EarliestDeposit end, TXIDs),
-			FilteredTXs = case After of
-				[] ->
-					Before;
-				[EarliestDeposit | _] ->
-					Before ++ [EarliestDeposit]
-			end,
-			{200, #{}, ar_serialize:jsonify(FilteredTXs), Req};
-		{'EXIT', {timeout, {gen_server, call, [ar_arql_db, _]}}} ->
-			{503, #{}, <<"ArQL unavailable.">>, Req}
+	{ok, Config} = application:get_env(arweave, config),
+	case lists:member(serve_wallet_deposits, Config#config.enable) of
+		true ->
+			ar_semaphore:acquire(arql_semaphore(Req), 5000),
+			case catch ar_arql_db:select_txs_by([{to, [Addr]}]) of
+				TXMaps when is_list(TXMaps) ->
+					TXIDs = lists:map(fun(#{ id := ID }) -> ID end, TXMaps),
+					{Before, After} = lists:splitwith(fun(T) -> T /= EarliestDeposit end, TXIDs),
+					FilteredTXs = case After of
+						[] ->
+							Before;
+						[EarliestDeposit | _] ->
+							Before ++ [EarliestDeposit]
+					end,
+					{200, #{}, ar_serialize:jsonify(FilteredTXs), Req};
+				{'EXIT', {timeout, {gen_server, call, [ar_arql_db, _]}}} ->
+					{503, #{}, <<"ArQL unavailable.">>, Req}
+			end;
+		false ->
+			{421, #{}, jiffy:encode(#{ error => endpoint_not_enabled }), Req}
 	end;
 
 %% Return the block with the given height or hash.
 %% GET request to endpoint /block/{height|hash}/{height|hash}.
-handle(<<"GET">>, [<<"block">>, Type, ID], Req, _Pid)
+handle(<<"GET">>, [<<"block">>, Type, ID], Req, Pid)
 		when Type == <<"height">> orelse Type == <<"hash">> ->
-	Filename =
-		case Type of
-			<<"hash">> ->
-				case hash_to_filename(block, ID) of
-					{error, invalid}		-> invalid_hash;
-					{error, _, unavailable} -> unavailable;
-					{ok, Fn}				-> Fn
-				end;
-			<<"height">> ->
-				case ar_node:is_joined() of
-					false ->
-						not_joined;
-					true ->
-						CurrentHeight = ar_node:get_height(),
-						try binary_to_integer(ID) of
-							Height when Height < 0 ->
-								invalid_height;
-							Height when Height > CurrentHeight ->
-								unavailable;
-							Height ->
-								ok = ar_semaphore:acquire(block_index_semaphore, infinity),
-								BI = ar_node:get_block_index(),
-								Len = length(BI),
-								case Height > Len - 1 of
-									true ->
-										unavailable;
-									false ->
-										{H, _, _} = lists:nth(Len - Height, BI),
-										ar_storage:lookup_block_filename(H)
-								end
-						catch _:_ ->
-							invalid_height
-						end
-				end
-		end,
-	case Filename of
-		invalid_hash ->
-			{400, #{}, <<"Invalid hash.">>, Req};
-		invalid_height ->
-			{400, #{}, <<"Invalid height.">>, Req};
-		unavailable ->
-			{404, #{}, <<"Block not found.">>, Req};
-		not_joined ->
-			not_joined(Req);
-		_  ->
-			{200, #{}, sendfile(Filename), Req}
+	case Type of
+		<<"hash">> ->
+			case ar_util:safe_decode(ID) of
+				{error, invalid} ->
+					{404, #{}, <<"Block not found.">>, Req};
+				{ok, H} ->
+					ReadB =
+						case ar_randomx_state:get_key_block(H) of
+							not_found ->
+								ar_storage:read_block(H);
+							{ok, B} ->
+								B
+						end,
+					case ReadB of
+						unavailable ->
+							{404, #{}, <<"Block not found.">>, Req};
+						#block{} ->
+							{200, #{}, ar_serialize:jsonify(
+									ar_serialize:block_to_json_struct(ReadB)), Req}
+					end
+			end;
+		<<"height">> ->
+			case ar_node:is_joined() of
+				false ->
+					not_joined(Req);
+				true ->
+					CurrentHeight = ar_node:get_height(),
+					try binary_to_integer(ID) of
+						Height when Height < 0 ->
+							{400, #{}, <<"Invalid height.">>, Req};
+						Height when Height > CurrentHeight ->
+							{404, #{}, <<"Block not found.">>, Req};
+						Height ->
+							case ar_node:get_recent_block_hash_by_height(Height) of
+								not_found ->
+									ok = ar_semaphore:acquire(get_block_index, infinity),
+									BI = ar_node:get_block_index(),
+									Len = length(BI),
+									case Height > Len - 1 of
+										true ->
+											{404, #{}, <<"Block not found.">>, Req};
+										false ->
+											{H, _, _} = lists:nth(Len - Height, BI),
+											handle(<<"GET">>, [<<"block">>, <<"hash">>,
+													ar_util:encode(H)], Req, Pid)
+									end;
+								H ->
+									handle(<<"GET">>, [<<"block">>, <<"hash">>,
+											ar_util:encode(H)], Req, Pid)
+							end
+					catch _:_ ->
+						{400, #{}, <<"Invalid height.">>, Req}
+					end
+			end
 	end;
 
 %% Return block or block field.
-handle(<<"GET">>, [<<"block">>, Type, IDBin, Field], Req, _Pid)
+handle(<<"GET">>, [<<"block">>, Type, ID, Field], Req, _Pid)
 		when Type == <<"height">> orelse Type == <<"hash">> ->
 	case ar_node:is_joined() of
 		false ->
 			not_joined(Req);
 		true ->
-			case validate_get_block_type_id(Type, IDBin) of
-				{error, {Status, Headers, Body}} ->
-					{Status, Headers, Body, Req};
-				{ok, ID} ->
-					process_request(get_block, [Type, ID, Field], Req)
-			end
+			process_request(get_block, [Type, ID, Field], Req)
 	end;
 
 %% Return the current block.
@@ -804,67 +937,47 @@ handle(<<"GET">>, [<<"tx">>, Hash, Field], Req, _Pid) ->
 		false ->
 			not_joined(Req);
 		true ->
-			case hash_to_filename(tx, Hash) of
-				{error, invalid} ->
-					{400, #{}, <<"Invalid hash.">>, Req};
-				{error, ID, unavailable} ->
-					case is_a_pending_tx(ID) of
+			ReadTX =
+				case ar_util:safe_decode(Hash) of
+					{error, invalid} ->
+						{reply, {400, #{}, <<"Invalid hash.">>, Req}};
+					{ok, ID} ->
+						{ar_storage:read_tx(ID), ID}
+				end,
+			case ReadTX of
+				{unavailable, TXID} ->
+					case is_a_pending_tx(TXID) of
 						true ->
 							{202, #{}, <<"Pending">>, Req};
 						false ->
 							{404, #{}, <<"Not Found.">>, Req}
 					end;
-				{Status, Filename} ->
+				{reply, Reply} ->
+					Reply;
+				{#tx{} = TX, _} ->
 					case Field of
 						<<"tags">> ->
-							case ar_storage:read_tx_file(Filename) of
-								{ok, TX} ->
-									{200, #{}, ar_serialize:jsonify(
-										lists:map(
-											fun({Name, Value}) ->
-												{
-													[
-														{name, ar_util:encode(Name)},
-														{value, ar_util:encode(Value)}
-													]
-												}
-											end,
-											TX#tx.tags
-										)
-									), Req};
-								{error, enoent} ->
-									{404, #{}, <<>>, Req};
-								_ ->
-									{500, #{}, <<>>, Req}
-							end;
+							{200, #{}, ar_serialize:jsonify(lists:map(
+									fun({Name, Value}) ->
+										{[{name, ar_util:encode(Name)},
+												{value, ar_util:encode(Value)}]}
+									end,
+									TX#tx.tags)), Req};
 						<<"data">> ->
-							Result =
-								case Status of
-									ok ->
-										ar_storage:read_tx_file(Filename);
-									migrated_v1 ->
-										ar_storage:read_migrated_v1_tx_file(Filename)
-								end,
-							case Result of
-								{ok, TX} ->
-									serve_tx_data(Req, TX);
-								{error, enoent} ->
-									{404, #{}, <<>>, Req};
-								{error, data_unavailable} ->
-									{404, #{}, <<>>, Req};
-								_ ->
-									{500, #{}, <<>>, Req}
-							end;
+							serve_tx_data(Req, TX);
 						_ ->
-							case file:read_file(Filename) of
-								{ok, JSONBlock} ->
-									{TXJSON} = ar_serialize:dejsonify(JSONBlock),
-									Res = val_for_key(Field, TXJSON),
-									{200, #{}, Res, Req};
-								{error, enoent} ->
-									{404, #{}, <<>>, Req};
-								_ ->
-									{500, #{}, <<>>, Req}
+							case catch binary_to_existing_atom(Field) of
+								{'EXIT', _} ->
+									{400, #{}, jiffy:encode(#{ error => invalid_field }), Req};
+								FieldAtom ->
+									{TXJSON} = ar_serialize:tx_to_json_struct(TX),
+									case catch val_for_key(FieldAtom, TXJSON) of
+										{'EXIT', _} ->
+											{400, #{}, jiffy:encode(#{ error => invalid_field }),
+													Req};
+										Val ->
+											{200, #{}, Val, Req}
+									end
 							end
 					end
 			end
@@ -912,61 +1025,53 @@ not_found(Req) ->
 not_joined(Req) ->
 	{503, #{}, jiffy:encode(#{ error => not_joined }), Req}.
 
-handle_get_tx_status(Hash, Req) ->
-	case get_tx_filename(Hash) of
-		{Source, _} when Source == ok orelse Source == migrated_v1 ->
-			case catch ar_arql_db:select_block_by_tx_id(Hash) of
-				{ok, #{
-					height := Height,
-					indep_hash := EncodedIndepHash
-				}} ->
-					PseudoTags = [
-						{<<"block_height">>, Height},
-						{<<"block_indep_hash">>, EncodedIndepHash}
-					],
-					case ar_node:is_in_block_index(ar_util:decode(EncodedIndepHash)) of
-						false ->
-							{404, #{}, <<"Not Found.">>, Req};
-						true ->
-							CurrentHeight = ar_node:get_height(),
-							%% First confirmation is when the TX is in the latest block.
-							NumberOfConfirmations = CurrentHeight - Height + 1,
-							Status =
-								PseudoTags
-								++ [{<<"number_of_confirmations">>, NumberOfConfirmations}],
-							{200, #{}, ar_serialize:jsonify({Status}), Req}
-					end;
-				not_found ->
-					{404, #{}, <<"Not Found.">>, Req};
-				{'EXIT', {timeout, {gen_server, call, [ar_arql_db, _]}}} ->
-					{503, #{}, <<"ArQL unavailable.">>, Req}
-			end;
-		{response, {Status, Headers, Body}} ->
-			{Status, Headers, Body, Req}
-	end.
-
-%% @doc Get the filename for an encoded TX id.
-get_tx_filename(Hash) ->
-	case hash_to_filename(tx, Hash) of
+handle_get_tx_status(EncodedTXID, Req) ->
+	case ar_util:safe_decode(EncodedTXID) of
 		{error, invalid} ->
-			{response, {400, #{}, <<"Invalid hash.">>}};
-		{error, ID, unavailable} ->
-			maybe_tx_is_pending_response(ID);
-		{Status, Filename} ->
-			{Status, Filename}
+			{400, #{}, <<"Invalid address.">>, Req};
+		{ok, TXID} ->
+			case is_a_pending_tx(TXID) of
+				true ->
+					{202, #{}, <<"Pending">>, Req};
+				false ->
+					case ar_storage:get_tx_confirmation_data(TXID) of
+						{ok, {Height, BH}} ->
+							PseudoTags = [
+								{<<"block_height">>, Height},
+								{<<"block_indep_hash">>, ar_util:encode(BH)}
+							],
+							ok = ar_semaphore:acquire(get_block_index, infinity),
+							case ar_node:is_in_block_index(BH) of
+								false ->
+									{404, #{}, <<"Not Found.">>, Req};
+								true ->
+									CurrentHeight = ar_node:get_height(),
+									%% First confirmation is when the TX is in the latest block.
+									NumberOfConfirmations = CurrentHeight - Height + 1,
+									Status = PseudoTags
+											++ [{<<"number_of_confirmations">>,
+												NumberOfConfirmations}],
+									{200, #{}, ar_serialize:jsonify({Status}), Req}
+							end;
+						not_found ->
+							{404, #{}, <<"Not Found.">>, Req};
+						{error, timeout} ->
+							{503, #{}, <<"ArQL unavailable.">>, Req}
+					end
+			end
 	end.
 
-maybe_tx_is_pending_response(ID) ->
+maybe_tx_is_pending_response(ID, Req) ->
 	case is_a_pending_tx(ID) of
 		true ->
-			{response, {202, #{}, <<"Pending">>}};
+			{202, #{}, <<"Pending">>, Req};
 		false ->
 			case ar_tx_db:get_error_codes(ID) of
 				{ok, ErrorCodes} ->
 					ErrorBody = list_to_binary(lists:join(" ", ErrorCodes)),
-					{response, {410, #{}, ErrorBody}};
+					{410, #{}, ErrorBody, Req};
 				not_found ->
-					{response, {404, #{}, <<"Not Found.">>}}
+					{404, #{}, <<"Not Found.">>, Req}
 			end
 	end.
 
@@ -978,6 +1083,7 @@ serve_tx_data(Req, #tx{ format = 2, id = ID } = TX) ->
 		true ->
 			{200, #{}, sendfile(DataFilename), Req};
 		false ->
+			ok = ar_semaphore:acquire(get_tx_data, infinity),
 			case ar_data_sync:get_tx_data(ID) of
 				{ok, Data} ->
 					{200, #{}, ar_util:encode(Data), Req};
@@ -1009,6 +1115,7 @@ serve_format_2_html_data(Req, ContentType, TX) ->
 		{ok, Data} ->
 			{200, #{ <<"content-type">> => ContentType }, Data, Req};
 		{error, enoent} ->
+			ok = ar_semaphore:acquire(get_tx_data, infinity),
 			case ar_data_sync:get_tx_data(TX#tx.id) of
 				{ok, Data} ->
 					{200, #{ <<"content-type">> => ContentType }, Data, Req};
@@ -1029,63 +1136,32 @@ estimate_tx_fee(Size, Addr) ->
 				[{'or',
 					{'==', '$1', height},
 					{'==', '$1', wallet_list},
-					{'==', '$1', diff}}], ['$_']}]
+					{'==', '$1', usd_to_ar_rate},
+					{'==', '$1', scheduled_usd_to_ar_rate}}], ['$_']}]
 		),
 	Height = proplists:get_value(height, Props),
-	Diff = proplists:get_value(diff, Props),
+	CurrentRate = proplists:get_value(usd_to_ar_rate, Props),
+	ScheduledRate = proplists:get_value(scheduled_usd_to_ar_rate, Props),
+	%% Of the two rates - the currently active one and the one scheduled to be
+	%% used soon - pick the one that leads to a higher fee in AR to make sure the
+	%% transaction does not become underpaid.
+	Rate = ar_fraction:maximum(CurrentRate, ScheduledRate),
 	RootHash = proplists:get_value(wallet_list, Props),
-	case Height + 1 >= ar_fork:height_2_4() of
-		true ->
-			estimate_tx_fee(Size, Diff, Height + 1, Addr, RootHash);
-		false ->
-			estimate_tx_fee_pre_fork_2_4(Size, Addr, RootHash, Height + 1, Diff)
-	end.
+	PaidSize = ar_tx:get_weave_size_increase(Size, Height + 1),
+	estimate_tx_fee(PaidSize, Rate, Height + 1, Addr, RootHash).
 
-estimate_tx_fee(Size, Diff, Height, Addr, RootHash) ->
+estimate_tx_fee(Size, Rate, Height, Addr, RootHash) ->
 	Timestamp = os:system_time(second),
 	case Addr of
 		no_wallet ->
-			ar_tx:get_tx_fee(Size, Diff, Height, Timestamp);
+			ar_tx:get_tx_fee(Size, Rate, Height, Timestamp);
 		_ ->
 			Wallets = ar_wallets:get(RootHash, Addr),
-			ar_tx:get_tx_fee(Size, Diff, Height, Wallets, Addr, Timestamp)
-	end.
-
-estimate_tx_fee_pre_fork_2_4(Size, Addr, RootHash, Height, Diff) ->
-	%% Add a safety buffer to prevent transactions
-	%% from being rejected after a retarget when the
-	%% difficulty drops.
-	NextDiff = ar_difficulty:twice_smaller_diff(Diff),
-	Timestamp  = os:system_time(seconds),
-	Args = {Size, Diff, Height, Addr, RootHash, Timestamp},
-	CurrentDiffPrice = estimate_tx_fee_pre_fork_2_4(Args),
-	Args2 = {Size, NextDiff, Height, Addr, RootHash, Timestamp},
-	NextDiffPrice = estimate_tx_fee_pre_fork_2_4(Args2),
-	max(NextDiffPrice, CurrentDiffPrice).
-
-estimate_tx_fee_pre_fork_2_4(Args) ->
-	{Size, Diff, Height, Addr, RootHash, Timestamp} = Args,
-	case Addr of
-		no_wallet ->
-			ar_tx:get_tx_fee(
-				Size,
-				Diff,
-				Height,
-				Timestamp
-			);
-		Addr ->
-			ar_tx:get_tx_fee(
-				Size,
-				Diff,
-				Height,
-				ar_wallets:get(RootHash, Addr),
-				Addr,
-				Timestamp
-			)
+			ar_tx:get_tx_fee(Size, Rate, Height, Wallets, Addr, Timestamp)
 	end.
 
 handle_get_wallet_txs(Addr, EarliestTXID) ->
-	case ar_util:safe_decode(Addr) of
+	case ar_wallet:base64_address_with_optional_checksum_to_decoded_address_safe(Addr) of
 		{error, invalid} ->
 			{400, #{}, <<"Invalid address.">>};
 		{ok, _} ->
@@ -1119,30 +1195,8 @@ get_wallet_txs(EarliestTXID, [TXID | TXIDs], Acc) ->
 			get_wallet_txs(EarliestTXID, TXIDs, [TXID | Acc])
 	end.
 
-handle_post_tx(Req, PeerIP, TX) ->
-	case verify_mempool_txs_size(TX) of
-		invalid ->
-			handle_post_tx_no_mempool_space_response();
-		valid ->
-			Height = ar_node:get_height(),
-			handle_post_tx(Req, PeerIP, TX, Height)
-	end.
-
-handle_post_tx(Req, PeerIP, TX, Height) ->
-	Diff = ar_node:get_current_diff(),
-	RecentTXMap = ar_node:get_recent_txs_map(),
-	BlockAnchors = ar_node:get_block_anchors(),
-	MempoolTXs = ar_node:get_pending_txs([as_map, id_only]),
-	Wallets = ar_node:get_wallets(ar_tx:get_addresses([TX])),
-	case ar_tx_replay_pool:verify_tx({
-		TX,
-		Diff,
-		Height,
-		BlockAnchors,
-		RecentTXMap,
-		MempoolTXs,
-		Wallets
-	}) of
+handle_post_tx(Req, Peer, TX) ->
+	case ar_tx_validator:validate(TX, Peer) of
 		{invalid, tx_verification_failed} ->
 			handle_post_tx_verification_response();
 		{invalid, last_tx_in_mempool} ->
@@ -1155,50 +1209,25 @@ handle_post_tx(Req, PeerIP, TX, Height) ->
 			handle_post_tx_already_in_weave_response();
 		{invalid, tx_already_in_mempool} ->
 			handle_post_tx_already_in_mempool_response();
+		{invalid, invalid_data_root_size} ->
+			handle_post_tx_invalid_data_root_response();
 		valid  ->
-			handle_post_tx_accepted(Req, PeerIP, TX)
+			handle_post_tx_accepted(Req, Peer)
 	end.
 
-verify_mempool_txs_size(TX) ->
-	{HeaderSize, DataSize} = ar_node_worker:tx_mempool_size(TX),
-	{MempoolHeaderSize, MempoolDataSize} = ar_node:get_mempool_size(),
-	case MempoolHeaderSize + HeaderSize > ?MEMPOOL_HEADER_SIZE_LIMIT of
-		true ->
-			invalid;
-		false ->
-			case DataSize + MempoolDataSize > ?MEMPOOL_DATA_SIZE_LIMIT of
-				true ->
-					invalid;
-				false ->
-					valid
-			end
-	end.
-
-handle_post_tx_accepted(Req, PeerIP, TX) ->
+handle_post_tx_accepted(Req, Peer) ->
 	%% Exclude successful requests with valid transactions from the
 	%% IP-based throttling, to avoid connectivity issues at the times
 	%% of excessive transaction volumes.
-	ar_blacklist_middleware:decrement_ip_addr(PeerIP, Req),
-	ar_bridge:add_tx(TX),
-	case TX#tx.format of
-		2 ->
-			ar_data_sync:add_data_root_to_disk_pool(TX#tx.data_root, TX#tx.data_size, TX#tx.id);
-		1 ->
-			ok
-	end.
+	{A, B, C, D, _} = Peer,
+	ar_blacklist_middleware:decrement_ip_addr({A, B, C, D}, Req),
+	ok.
 
 handle_post_tx_verification_response() ->
 	{error_response, {400, #{}, <<"Transaction verification failed.">>}}.
 
 handle_post_tx_last_tx_in_mempool_response() ->
 	{error_response, {400, #{}, <<"Invalid anchor (last_tx from mempool).">>}}.
-
-handle_post_tx_no_mempool_space_response() ->
-	?LOG_ERROR([
-		{event, ar_http_iface_middleware_rejected_transaction},
-		{reason, mempool_is_full}
-	]),
-	{error_response, {400, #{}, <<"Mempool is full.">>}}.
 
 handle_post_tx_bad_anchor_response() ->
 	{error_response, {400, #{}, <<"Invalid anchor (last_tx).">>}}.
@@ -1209,6 +1238,9 @@ handle_post_tx_already_in_weave_response() ->
 handle_post_tx_already_in_mempool_response() ->
 	{error_response, {400, #{}, <<"Transaction is already in the mempool.">>}}.
 
+handle_post_tx_invalid_data_root_response() ->
+	{error_response, {400, #{}, <<"The attached data is split in an unknown way.">>}}.
+
 handle_get_data_sync_record(Start, Limit, Req) ->
 	Format =
 		case cowboy_req:header(<<"content-type">>, Req) of
@@ -1217,11 +1249,46 @@ handle_get_data_sync_record(Start, Limit, Req) ->
 			_ ->
 				etf
 		end,
-	case ar_data_sync:get_sync_record(#{ start => Start, limit => Limit, format => Format }) of
+	Options = #{ start => Start, limit => Limit, format => Format },
+	case ar_sync_record:get_record(Options, ar_data_sync) of
 		{ok, Binary} ->
 			{200, #{}, Binary, Req};
 		{error, timeout} ->
 			{503, #{}, jiffy:encode(#{ error => timeout }), Req}
+	end.
+
+check_if_chunk_data_root_exists(Req) ->
+	case cowboy_req:header(<<"arweave-data-root">>, Req, not_set) of
+		EncodedDataRoot when byte_size(EncodedDataRoot) == 43 ->
+			case cowboy_req:header(<<"arweave-data-size">>, Req, not_set) of
+				not_set ->
+					continue;
+				MaybeNumber ->
+					case catch binary_to_integer(MaybeNumber) of
+						DataSize when is_integer(DataSize) ->
+							case ar_util:safe_decode(EncodedDataRoot) of
+								{ok, DataRoot} ->
+									case ar_data_sync:has_data_root(DataRoot, DataSize) of
+										true ->
+											continue;
+										false ->
+											{reply, {400, #{},
+												jiffy:encode(#{
+													error => data_root_not_found }), Req}};
+										{error, timeout} ->
+											{reply,
+												{503, #{},
+													jiffy:encode(#{ error => timeout }), Req}}
+									end;
+								_ ->
+									continue
+							end;
+						_ ->
+							continue
+					end
+			end;
+		_ ->
+			continue
 	end.
 
 handle_post_chunk(Proof, Req) ->
@@ -1302,7 +1369,7 @@ check_internal_api_secret(Req) ->
 			cowboy_req:header(<<"x-internal-api-secret">>, Req)} of
 		{not_set, _} ->
 			Reject("Request to disabled internal API");
-		{_Secret, _Secret} when is_binary(_Secret) ->
+		{Secret, Secret} when is_binary(Secret) ->
 			pass;
 		_ ->
 			Reject("Invalid secret for internal API request")
@@ -1317,38 +1384,18 @@ log_internal_api_reject(Msg, Req) ->
 	end).
 
 %% @doc Convert a blocks field with the given label into a string.
-block_field_to_string(<<"nonce">>, Res) -> Res;
-block_field_to_string(<<"previous_block">>, Res) -> Res;
 block_field_to_string(<<"timestamp">>, Res) -> integer_to_list(Res);
 block_field_to_string(<<"last_retarget">>, Res) -> integer_to_list(Res);
 block_field_to_string(<<"diff">>, Res) -> integer_to_list(Res);
+block_field_to_string(<<"cumulative_diff">>, Res) -> integer_to_list(Res);
 block_field_to_string(<<"height">>, Res) -> integer_to_list(Res);
-block_field_to_string(<<"hash">>, Res) -> Res;
-block_field_to_string(<<"indep_hash">>, Res) -> Res;
 block_field_to_string(<<"txs">>, Res) -> ar_serialize:jsonify(Res);
 block_field_to_string(<<"hash_list">>, Res) -> ar_serialize:jsonify(Res);
 block_field_to_string(<<"wallet_list">>, Res) -> ar_serialize:jsonify(Res);
-block_field_to_string(<<"reward_addr">>, Res) -> Res.
-
-hash_to_filename(Type, Hash) ->
-	case ar_util:safe_decode(Hash) of
-		{error, invalid} ->
-			{error, invalid};
-		{ok, ID} ->
-			hash_to_filename_decoded(Type, ID)
-	end.
-
-hash_to_filename_decoded(Type, ID) ->
-	{Mod, Fun} = type_to_mf({Type, lookup_filename}),
-	F = apply(Mod, Fun, [ID]),
-	case F of
-		unavailable ->
-			{error, ID, unavailable};
-		Filename when Type == block ->
-			{ok, Filename};
-		Response ->
-			Response
-	end.
+block_field_to_string(<<"usd_to_ar_rate">>, Res) -> ar_serialize:jsonify(Res);
+block_field_to_string(<<"scheduled_usd_to_ar_rate">>, Res) -> ar_serialize:jsonify(Res);
+block_field_to_string(<<"poa">>, Res) -> ar_serialize:jsonify(Res);
+block_field_to_string(_, Res) -> Res.
 
 %% @doc Return true if ID is a pending tx.
 is_a_pending_tx(ID) ->
@@ -1372,6 +1419,7 @@ return_info(Req) ->
 		timer:tc(fun() -> ar_node:get_current_block_hash() end),
 	{Time2, Height} =
 		timer:tc(fun() -> ar_node:get_height() end),
+	[{_, BlockCount}] = ets:lookup(ar_header_sync, synced_blocks),
 	{200, #{},
 		ar_serialize:jsonify(
 			{
@@ -1391,7 +1439,7 @@ return_info(Req) ->
 							false -> ar_util:encode(Current)
 						end
 					},
-					{blocks, ar_storage:blocks_on_disk()},
+					{blocks, BlockCount},
 					{peers, length(ar_bridge:get_remote_peers())},
 					{queue_length,
 						element(
@@ -1404,12 +1452,6 @@ return_info(Req) ->
 			}
 		),
 	Req}.
-
-%% @doc converts a tuple of atoms to a {Module, Function} tuple.
-type_to_mf({tx, lookup_filename}) ->
-	{ar_storage, lookup_tx_filename};
-type_to_mf({block, lookup_filename}) ->
-	{ar_storage, lookup_block_filename}.
 
 %% @doc Convenience function for lists:keyfind(Key, 1, List). Returns Value, not {Key, Value}.
 val_for_key(K, L) ->
@@ -1499,7 +1541,7 @@ post_block(check_indep_hash, {BShadow, OrigPeer}, Req, ReceiveTimestamp) ->
 				true ->
 					case catch compute_hash(BShadow, PrevHeight + 1) of
 						{BDS, BH} ->
-							ar_ignore_registry:add_temporary(BH, 500),
+							ar_ignore_registry:add_temporary(BH, 5000),
 							post_block(
 								check_timestamp,
 								{BShadow, OrigPeer, BDS, PrevB},
@@ -1547,12 +1589,17 @@ post_block(check_difficulty, {BShadow, OrigPeer, BDS, PrevB}, Req, ReceiveTimest
 %% the network.
 post_block(check_pow, {BShadow, OrigPeer, BDS, PrevB}, Req, ReceiveTimestamp) ->
 	Nonce = BShadow#block.nonce,
-	#block{ height = PrevHeight } = PrevB,
+	#block{ indep_hash = PrevH, height = PrevHeight } = PrevB,
 	Height = PrevHeight + 1,
 	MaybeValid =
 		case Height >= ar_fork:height_2_4() of
 			true ->
-				validate_spora_pow(BShadow, PrevB, BDS);
+				case ar_node:get_recent_search_space_upper_bound_by_prev_h(PrevH) of
+					not_found ->
+						{reply, {412, #{}, <<>>, Req}};
+					SearchSpaceUpperBound ->
+						validate_spora_pow(BShadow, PrevB, BDS, SearchSpaceUpperBound)
+				end;
 			false ->
 				case ar_mine:validate(BDS, Nonce, BShadow#block.diff, Height) of
 					{invalid, _} ->
@@ -1562,6 +1609,8 @@ post_block(check_pow, {BShadow, OrigPeer, BDS, PrevB}, Req, ReceiveTimestamp) ->
 				end
 		end,
 	case MaybeValid of
+		{reply, Reply} ->
+			Reply;
 		true ->
 			post_block(post_block, {BShadow, OrigPeer, BDS}, Req, ReceiveTimestamp);
 		false ->
@@ -1569,18 +1618,13 @@ post_block(check_pow, {BShadow, OrigPeer, BDS, PrevB}, Req, ReceiveTimestamp) ->
 			ar_blacklist_middleware:ban_peer(OrigPeer, ?BAD_POW_BAN_TIME),
 			{400, #{}, <<"Invalid Block Proof of Work">>, Req}
 	end;
-post_block(post_block, {BShadow, OrigPeer, BDS}, Req, ReceiveTimestamp) ->
+post_block(post_block, {BShadow, OrigPeer, _BDS}, Req, ReceiveTimestamp) ->
 	record_block_pre_validation_time(ReceiveTimestamp),
 	?LOG_INFO([
 		{event, ar_http_iface_handler_accepted_block},
 		{indep_hash, ar_util:encode(BShadow#block.indep_hash)}
 	]),
-	ar_bridge:add_block(
-		OrigPeer,
-		BShadow,
-		BDS,
-		ReceiveTimestamp
-	),
+	ar_events:send(block, {new, BShadow, OrigPeer}),
 	{200, #{}, <<"OK">>, Req}.
 
 compute_hash(B, Height) ->
@@ -1594,28 +1638,57 @@ compute_hash(B, Height) ->
 			{BDS, ar_weave:indep_hash(BDS, Hash, Nonce)}
 	end.
 
-validate_spora_pow(B, PrevB, BDS) ->
-	#block{
-		height = PrevHeight,
-		indep_hash = PrevH
-	} = PrevB,
-	#block{
-		height = Height,
-		nonce = Nonce,
-		timestamp = Timestamp,
-		poa = #poa{ chunk = Chunk }
-	} = B,
+validate_spora_pow(B, PrevB, BDS, SearchSpaceUpperBound) ->
+	#block{ height = PrevHeight, indep_hash = PrevH } = PrevB,
+	#block{ height = Height, nonce = Nonce, timestamp = Timestamp,
+			poa = #poa{ chunk = Chunk } = SPoA } = B,
 	Root = ar_block:compute_hash_list_merkle(PrevB),
 	case {Root, PrevHeight + 1} == {B#block.hash_list_merkle, Height} of
 		false ->
 			false;
 		true ->
-			H0 = ar_weave:hash(BDS, Nonce, Height),
-			SolutionHash =
-				ar_mine:spora_solution_hash(PrevH, Timestamp, H0, Chunk, Height),
-			ar_mine:validate(SolutionHash, B#block.diff, Height)
-				andalso SolutionHash == B#block.hash
+			{H0, Entropy} = ar_mine:spora_h0_with_entropy(BDS, Nonce, Height),
+			ComputeSolutionHash =
+				case ar_mine:pick_recall_byte(H0, PrevH, SearchSpaceUpperBound) of
+					{error, weave_size_too_small} ->
+						case SPoA == #poa{} of
+							false ->
+								false;
+							true ->
+								ar_mine:spora_solution_hash(PrevH, Timestamp, H0, Chunk, Height)
+						end;
+					{ok, RecallByte} ->
+						PackingThreshold = ar_block:get_packing_threshold(PrevB,
+								SearchSpaceUpperBound),
+						case verify_packing_threshold(B, PackingThreshold) of
+							false ->
+								false;
+							true ->
+								case RecallByte >= PackingThreshold of
+									true ->
+										ar_mine:spora_solution_hash_with_entropy(PrevH,
+												Timestamp, H0, Chunk, Entropy, Height);
+									false ->
+										ar_mine:spora_solution_hash(PrevH, Timestamp, H0, Chunk,
+												Height)
+								end
+						end
+				end,
+			case ComputeSolutionHash of
+				false ->
+					false;
+				SolutionHash ->
+					ar_mine:validate(SolutionHash, B#block.diff, Height)
+						andalso SolutionHash == B#block.hash
+			end
 	end.
+
+verify_packing_threshold(_B, undefined) ->
+	true;
+verify_packing_threshold(#block{ packing_2_5_threshold = PackingThreshold }, PackingThreshold) ->
+	true;
+verify_packing_threshold(_, _) ->
+	false.
 
 post_block_reject_warn(BShadow, Step, Peer) ->
 	?LOG_WARNING([
@@ -1640,7 +1713,7 @@ record_block_pre_validation_time(ReceiveTimestamp) ->
 
 %% Return the block hash list associated with a block.
 process_request(get_block, [Type, ID, <<"hash_list">>], Req) ->
-	ok = ar_semaphore:acquire(block_index_semaphore, infinity),
+	ok = ar_semaphore:acquire(get_block_index, infinity),
 	CurrentBI = ar_node:get_block_index(),
 	case is_block_known(Type, ID, CurrentBI) of
 		{error, height_not_integer} ->
@@ -1667,89 +1740,78 @@ process_request(get_block, [Type, ID, <<"hash_list">>], Req) ->
 	end;
 %% @doc Return the wallet list associated with a block.
 process_request(get_block, [Type, ID, <<"wallet_list">>], Req) ->
-	MaybeFilename = case Type of
+	case Type of
 		<<"height">> ->
 			CurrentHeight = ar_node:get_height(),
 			case ID of
 				Height when Height < 0 ->
-					unavailable;
+					{404, #{}, <<"Block not found.">>, Req};
 				Height when Height > CurrentHeight ->
-					unavailable;
+					{404, #{}, <<"Block not found.">>, Req};
 				Height ->
 					BI = ar_node:get_block_index(),
 					Len = length(BI),
 					case Height > Len - 1 of
 						true ->
-							unavailable;
+							{404, #{}, <<"Block not found.">>, Req};
 						false ->
 							{H, _, _} = lists:nth(Len - Height, BI),
-							ar_storage:lookup_block_filename(H)
+							process_request(get_block, [<<"hash">>, ar_util:encode(H),
+									<<"wallet_list">>], Req)
 					end
 			end;
 		<<"hash">> ->
-			ar_storage:lookup_block_filename(ID)
-	end,
-	case MaybeFilename of
-		unavailable ->
-			{404, #{}, <<"Block not found.">>, Req};
-		Filename ->
-			{ok, Binary} = file:read_file(Filename),
-			B = ar_serialize:json_struct_to_block(Binary),
-			case {B#block.height >= ar_fork:height_2_2(), ar_meta_db:get(serve_wallet_lists)} of
-				{true, false} ->
-					{400, #{},
-						jiffy:encode(#{ error => does_not_serve_blocks_after_2_2_fork }), Req};
-				{true, _} ->
-					ok = ar_semaphore:acquire(wallet_list_semaphore, infinity),
-					case ar_storage:read_wallet_list(B#block.wallet_list) of
-						{ok, Tree} ->
-							{200, #{}, ar_serialize:jsonify(
-								ar_serialize:wallet_list_to_json_struct(
-									B#block.reward_addr, false, Tree
-								)), Req};
+			ReadB =
+				case ar_util:safe_decode(ID) of
+					{ok, H} ->
+						ar_storage:read_block(H);
+					{error, invalid} ->
+						{reply, {404, #{}, <<"Block not found.">>, Req}}
+				end,
+			case ReadB of
+				{reply, Reply} ->
+					Reply;
+				unavailable ->
+					{404, #{}, <<"Block not found.">>, Req};
+				#block{} = B ->
+					case {B#block.height >= ar_fork:height_2_2(),
+							ar_meta_db:get(serve_wallet_lists)} of
+						{true, false} ->
+							{400, #{},
+								jiffy:encode(#{ error => does_not_serve_blocks_after_2_2_fork }),
+										Req};
+						{true, _} ->
+							ok = ar_semaphore:acquire(get_wallet_list, infinity),
+							case ar_storage:read_wallet_list(B#block.wallet_list) of
+								{ok, Tree} ->
+									{200, #{}, ar_serialize:jsonify(
+										ar_serialize:wallet_list_to_json_struct(
+											B#block.reward_addr, false, Tree
+										)), Req};
+								_ ->
+									{404, #{}, <<"Block not found.">>, Req}
+							end;
 						_ ->
-							{404, #{}, <<"Block not found.">>, Req}
+							WLFilepath = ar_storage:wallet_list_filepath(B#block.wallet_list),
+							case filelib:is_file(WLFilepath) of
+								true ->
+									{200, #{}, sendfile(WLFilepath), Req};
+								false ->
+									{404, #{}, <<"Block not found.">>, Req}
+							end
 					end;
 				_ ->
-					WLFilepath = ar_storage:wallet_list_filepath(B#block.wallet_list),
-					case filelib:is_file(WLFilepath) of
-						true ->
-							{200, #{}, sendfile(WLFilepath), Req};
-						false ->
-							{404, #{}, <<"Block not found.">>, Req}
-					end
+					{404, #{}, <<"Block not found.">>, Req}
 			end
 	end;
 %% Return the block reward
 process_request(get_block, [Type, ID, <<"reward">>], Req) ->
-	MaybeFilename = case Type of
-		<<"height">> ->
-			CurrentHeight = ar_node:get_height(),
-			case ID of
-				Height when Height < 0 ->
-					unavailable;
-				Height when Height > CurrentHeight ->
-					unavailable;
-				Height ->
-					BI = ar_node:get_block_index(),
-					Len = length(BI),
-					case Height > Len - 1 of
-						true ->
-							unavailable;
-						false ->
-							{H, _, _} = lists:nth(Len - Height, BI),
-							ar_storage:lookup_block_filename(H)
-					end
-			end;
-		<<"hash">> ->
-			ar_storage:lookup_block_filename(ID)
-	end,
-	case MaybeFilename of
+	case find_block(Type, ID) of
+		{error, height_not_integer} ->
+			{400, #{}, jiffy:encode(#{ error => size_must_be_an_integer }), Req};
 		unavailable ->
-			{404, #{}, <<"Block not found.">>, Req};
-		Filename ->
-			{ok, Binary} = file:read_file(Filename),
-			B = ar_serialize:json_struct_to_block(Binary),
+			{404, #{}, <<"Not Found.">>, Req};
+		B ->
 			case B#block.height of
 				0 ->
 					{200, #{}, "0", Req};
@@ -1757,34 +1819,18 @@ process_request(get_block, [Type, ID, <<"reward">>], Req) ->
 					TXs =
 						lists:map(
 							fun(Hash) ->
-								case hash_to_filename_decoded(tx, Hash) of
-									{error, invalid} ->
-										{error, 400, #{}, <<"TX Invalid hash.">>, Req};
-									{error, ID, unavailable} ->
+								case ar_storage:read_tx(Hash) of
+									unavailable ->
 										case is_a_pending_tx(ID) of
 											true ->
+												io:format("pending tx txid=~p height=~p", [Hash, B#block.height]),
 												{error, 202, #{}, <<"TX Pending">>, Req};
 											false ->
+												io:format("unavailable1 tx txid=~p height=~p", [Hash, B#block.height]),
 												{error, 404, #{}, <<"TX Not Found.">>, Req}
 										end;
-									{Status, FilenameTx} ->
-										Result =
-											case Status of
-												ok ->
-													ar_storage:read_tx_file(FilenameTx);
-												migrated_v1 ->
-													ar_storage:read_migrated_v1_tx_file(FilenameTx)
-											end,
-										case Result of
-											{ok, TX} ->
-												{ok, TX};
-											{error, enoent} ->
-												{error, 404, #{}, <<>>, Req};
-											{error, data_unavailable} ->
-												{error, 404, #{}, <<>>, Req};
-											_ ->
-												{error, 500, #{}, <<>>, Req}
-										end
+									#tx{} = TX ->
+										{ok, TX}
 								end
 							end,
 							B#block.txs
@@ -1811,24 +1857,35 @@ process_request(get_block, [Type, ID, <<"reward">>], Req) ->
 									{200, #{}, "0", Req};
 								_ ->
 									PrevH = B#block.previous_block,
-									PrevH_filename = ar_storage:lookup_block_filename(PrevH),
-									{ok, Binary_prev} = file:read_file(PrevH_filename),
-									PrevB = ar_serialize:json_struct_to_block(Binary_prev),
-									{FinderReward, _RewardPool} =
-										ar_node_utils:get_miner_reward_and_endowment_pool({
-											PrevB#block.reward_pool,
-											Tx_list,
-											B#block.reward_addr,
-											B#block.weave_size,
-											B#block.height,
-											B#block.diff,
-											B#block.timestamp
-										}),
-									{200, #{}, integer_to_binary(FinderReward), Req}
+									case ar_storage:read_block(PrevH) of
+										{error, height_not_integer} ->
+											{400, #{}, jiffy:encode(#{ error => size_must_be_an_integer }), Req};
+										unavailable ->
+											io:format("prev block not found curr_height=~p prev_hash=~p", [B#block.height, B#block.previous_block]),
+											{404, #{}, <<"prev block not found">>, Req};
+										PrevB ->
+											% WRONG
+											% Rate = ar_pricing:usd_to_ar_rate(PrevB),
+											% {Rate, _} = ar_pricing:recalculate_usd_to_ar_rate(PrevB),
+											Rate = ar_pricing:usd_to_ar_rate(PrevB),
+											{FinderReward, _RewardPool} =
+												ar_pricing:get_miner_reward_and_endowment_pool({
+													PrevB#block.reward_pool,
+													Tx_list,
+													B#block.reward_addr,
+													B#block.weave_size,
+													B#block.height,
+													% B#block.diff,
+													B#block.timestamp,
+													Rate
+												}),
+											{200, #{}, integer_to_binary(FinderReward), Req}
+									end
 							end
 					end
 			end
 	end;
+
 %% Return a requested field of a given block.
 %% GET request to endpoint /block/hash/{hash|height}/{field}.
 %%
@@ -1848,9 +1905,13 @@ process_request(get_block, [Type, ID, Field], Req) ->
 						{'EXIT', _} ->
 							{404, #{}, <<"Not Found.">>, Req};
 						Atom ->
-							{_, Res} = lists:keyfind(Atom, 1, BLOCKJSON),
-							Result = block_field_to_string(Field, Res),
-							{200, #{}, Result, Req}
+							case lists:keyfind(Atom, 1, BLOCKJSON) of
+								{_, Res} ->
+									Result = block_field_to_string(Field, Res),
+									{200, #{}, Result, Req};
+								_ ->
+									{404, #{}, <<"Not Found.">>, Req}
+							end
 					end
 			end;
 		_ ->
@@ -1903,18 +1964,6 @@ wallet_list_chunk_to_json(#{ next_cursor := NextCursor, wallets := Wallets }) ->
 			})
 	end.
 
-validate_get_block_type_id(<<"height">>, ID) ->
-	try binary_to_integer(ID) of
-		Int -> {ok, Int}
-	catch _:_ ->
-		{error, {400, #{}, <<"Invalid height.">>}}
-	end;
-validate_get_block_type_id(<<"hash">>, ID) ->
-	case ar_util:safe_decode(ID) of
-		{ok, Hash} -> {ok, Hash};
-		{error, invalid} -> {error, {400, #{}, <<"Invalid hash.">>}}
-	end.
-
 %% @doc Take a block type specifier, an ID, and a BI, returning whether the
 %% given block is part of the BI.
 %% @end
@@ -1950,6 +1999,14 @@ find_block(<<"height">>, RawHeight) ->
 find_block(<<"hash">>, ID) ->
 	ar_storage:read_block(ID).
 
+is_tx_already_processed(TXID) ->
+	case ar_ignore_registry:member(TXID) of
+		true ->
+			true;
+		false ->
+			ets:member(node_state, {tx, TXID})
+	end.
+
 post_tx_parse_id({Req, Pid}) ->
 	post_tx_parse_id(check_header, {Req, Pid}).
 
@@ -1966,7 +2023,7 @@ post_tx_parse_id(check_header, {Req, Pid}) ->
 			end
 	end;
 post_tx_parse_id(check_body, {Req, Pid}) ->
-	{_, Chunk, Req2} = read_body_chunk(Req, Pid, 100, 10),
+	{_, Chunk, Req2} = read_body_chunk(Req, Pid, 100, 500),
 	case re:run(Chunk, <<"\"id\":\s*\"(?<ID>[A-Za-z0-9_-]{43})\"">>, [{capture, ['ID']}]) of
 		{match, [Part]} ->
 			TXID = ar_util:decode(binary:part(Chunk, Part)),
@@ -1975,14 +2032,15 @@ post_tx_parse_id(check_body, {Req, Pid}) ->
 			post_tx_parse_id(read_body, {not_set, Req2, Pid, <<>>})
 	end;
 post_tx_parse_id(check_ignore_list, {TXID, Req, Pid, FirstChunk}) ->
-	case ar_ignore_registry:member(TXID) of
+	case is_tx_already_processed(TXID) of
 		true ->
-			{error, tx_already_processed, Req};
+			{error, tx_already_processed, TXID, Req};
 		false ->
-			ar_ignore_registry:add_temporary(TXID, 500),
+			ar_ignore_registry:add_temporary(TXID, 5000),
 			post_tx_parse_id(read_body, {TXID, Req, Pid, FirstChunk})
 	end;
 post_tx_parse_id(read_body, {TXID, Req, Pid, FirstChunk}) ->
+	ok = ar_semaphore:acquire(post_tx, infinity),
 	case read_complete_body(Req, Pid) of
 		{ok, SecondChunk, Req2} ->
 			Body = iolist_to_binary([FirstChunk | SecondChunk]),
@@ -2027,11 +2085,11 @@ post_tx_parse_id(verify_id_match, {MaybeTXID, Req, TX}) ->
 				true ->
 					{error, invalid_hash, Req};
 				false ->
-					case ar_ignore_registry:member(TXID) of
+					case is_tx_already_processed(TXID) of
 						true ->
-							{error, tx_already_processed, Req};
+							{error, tx_already_processed, TXID, Req};
 						false ->
-							ar_ignore_registry:add_temporary(TXID, 500),
+							ar_ignore_registry:add_temporary(TXID, 5000),
 							{ok, TX}
 					end
 			end

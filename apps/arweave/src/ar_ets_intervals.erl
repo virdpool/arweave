@@ -7,14 +7,8 @@
 %%% @end
 -module(ar_ets_intervals).
 
--export([
-	init_from_gb_set/2,
-	add/3,
-	delete/3,
-	cut/2,
-	is_inside/2,
-	get_interval_with_byte/2
-]).
+-export([init_from_gb_set/2, add/3, delete/3, cut/2, is_inside/2, get_interval_with_byte/2,
+		get_next_interval_outside/3, get_next_interval/3]).
 
 -include_lib("eunit/include/eunit.hrl").
 
@@ -125,7 +119,7 @@ is_inside(Table, Offset) ->
 	end.
 
 %% @doc Return the interval containing the given offset, including the right bound,
-%% excluding the right bound, or not_found.
+%% excluding the left bound, or not_found.
 %% @end
 get_interval_with_byte(Table, Offset) ->
 	case ets:next(Table, Offset - 1) of
@@ -143,6 +137,43 @@ get_interval_with_byte(Table, Offset) ->
 				[] ->
 					%% The key should have been just removed, unlucky timing.
 					get_interval_with_byte(Table, Offset)
+			end
+	end.
+
+%% @doc Return the lowest interval outside the recorded set of intervals,
+%% strictly above the given Offset, and with the right bound at most RightBound.
+%% Return not_found if there are no such intervals.
+get_next_interval_outside(_Table, Offset, RightBound) when Offset >= RightBound ->
+	not_found;
+get_next_interval_outside(Table, Offset, RightBound) ->
+	case ets:next(Table, Offset) of
+		'$end_of_table' ->
+			{RightBound, Offset};
+		NextOffset ->
+			case ets:lookup(Table, NextOffset) of
+				[{NextOffset, Start}] when Start > Offset ->
+					{min(RightBound, Start), Offset};
+				_ ->
+					get_next_interval_outside(Table, NextOffset, RightBound)
+			end
+	end.
+
+%% @doc Return the lowest interval inside the recorded set of intervals with the
+%% end offset strictly above the given offset, and with the right bound at most RightBound.
+%% Return not_found if there are no such intervals.
+get_next_interval(Table, Offset, RightBound) ->
+	case ets:next(Table, Offset) of
+		'$end_of_table' ->
+			not_found;
+		NextOffset ->
+			case ets:lookup(Table, NextOffset) of
+				[{_NextOffset, Start}] when Start >= RightBound ->
+					not_found;
+				[{NextOffset, Start}] ->
+					{min(NextOffset, RightBound), Start};
+				[] ->
+					%% The key should have been just removed, unlucky timing.
+					get_next_interval(Table, Offset, RightBound)
 			end
 	end.
 

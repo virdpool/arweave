@@ -5,15 +5,9 @@
 
 -behaviour(application).
 
--export([
-	main/0, main/1, start/0, start/1, start/2, stop/1, stop_dependencies/0,
-	tests/0, tests/1, tests/2,
-	test_ipfs/0,
-	docs/0,
-	start_for_tests/0,
-	shutdown/1,
-	console/1, console/2
-]).
+-export([main/0, main/1, start/0, start/1, start/2, stop/1, stop_dependencies/0,
+		tests/0, tests/1, tests/2, test_ipfs/0, docs/0, start_for_tests/0, shutdown/1,
+		console/1, console/2]).
 
 -include_lib("arweave/include/ar.hrl").
 -include_lib("arweave/include/ar_config.hrl").
@@ -26,8 +20,12 @@
 	CORE_TEST_MODS,
 	[
 		ar,
-		ar_meta_db,
+		ar_sync_buckets,
 		ar_chunk_storage,
+		ar_poa,
+		ar_packing_server,
+		ar_node_utils,
+		ar_meta_db,
 		ar_webhook_tests,
 		ar_poller_tests,
 		ar_kv,
@@ -39,7 +37,6 @@
 		ar_diff_dag,
 		ar_config_tests,
 		ar_deep_hash,
-		ar_inflation,
 		ar_util,
 		ar_base64_compatibility_tests,
 		ar_storage,
@@ -48,7 +45,6 @@
 		ar_tx_db,
 		ar_tx,
 		ar_wallet,
-		ar_gossip,
 		ar_serialize,
 		ar_block,
 		ar_difficulty_tests,
@@ -58,17 +54,16 @@
 		ar_tx_blacklist_tests,
 		ar_data_sync_tests,
 		ar_header_sync_tests,
-		ar_poa_tests,
 		ar_node_tests,
 		ar_fork_recovery_tests,
 		ar_mine,
 		ar_tx_replay_pool_tests,
-		ar_tx_queue,
 		ar_http_iface_tests,
 		ar_multiple_txs_per_wallet_tests,
 		ar_pricing,
 		ar_gateway_middleware_tests,
 		ar_http_util_tests,
+		ar_inflation,
 		ar_mine_randomx_tests
 	]
 ).
@@ -108,10 +103,16 @@ show_help() ->
 			{"peer (ip:port)", "Join a network on a peer (or set of peers)."},
 			{"start_from_block_index", "Start the node from the latest stored block index."},
 			{"mine", "Automatically start mining once the netwok has been joined."},
+			{"pool_mine", "Alternate mining mode to pool-compatible (mutually exclusive with mine)."},
 			{"port", "The local port to use for mining. "
 						"This port must be accessible by remote peers."},
 			{"data_dir",
 				"The directory for storing the weave and the wallets (when generated)."},
+			{"shared_data_dir",
+				"The directory for storing shared data (rocksdb, data_sync_state, chunk_storage_index, header_sync_state)."},
+			{"chunk_dir",
+				"The directory (or set of directories) for storing the weave."},
+			{"no_auto_sync", "Do not automatically sync the weave."},
 			{"metrics_dir", "The directory for persisted metrics."},
 			{"polling (num)", lists:flatten(
 					io_lib:format(
@@ -120,9 +121,10 @@ show_help() ->
 						[?DEFAULT_POLLING_INTERVAL]
 					)
 			)},
-			{"clean", "Clear the block cache before starting."},
 			{"no_auto_join", "Do not automatically join the network of your peers."},
-			{"mining_addr (addr)", "The address that mining rewards should be credited to."},
+			{"mining_addr (addr)",
+				"The address that mining rewards should be credited to."
+				" Set 'unclaimed' to send all the rewards to the endowment pool."},
 			{"stage_one_hashing_threads (num)",
 				io_lib:format(
 					"The number of mining processes searching for the SPoRA chunks to read."
@@ -146,21 +148,40 @@ show_help() ->
 					"otherwise.",
 					[?NUM_STAGE_TWO_HASHING_PROCESSES]
 				)},
-			{"max_emitters (num)",
-				"The maximum number of transaction propagation processes (default 2)."},
+			{"max_emitters (num)", io_lib:format("The number of transaction propagation "
+				"processes to spawn. Default is ~B.", [?NUM_EMITTER_PROCESSES])},
+			{"tx_validators (num)", io_lib:format("The number of transaction validators"
+				" to spawn. Transaction validators validate transactions pushed to the node"
+				" or fetched from the peers. Default is ~B.", [?DEFAULT_TX_VALIDATOR_COUNT])},
 			{"tx_propagation_parallelization (num)",
-				"The maximum number of best peers to propagate transactions to at a time "
-				"(default 4)."},
-			{"max_propagation_peers (num)",
-				"The maximum number of best peers to propagate blocks and transactions to. "
-				"Default is 50."},
+				"DEPRECATED. Does not affect anything."},
+			{"max_propagation_peers", io_lib:format(
+				"The maximum number of peers to propagate transactions to. "
+				"Default is ~B.", [?DEFAULT_MAX_PROPAGATION_PEERS])},
+			{"max_block_propagation_peers", io_lib:format("max_block_propagation_peers (num)"
+				"The maximum number of best peers to propagate blocks to. "
+				"Default is ~B.", [?DEFAULT_MAX_BLOCK_PROPAGATION_PEERS])},
 			{"sync_jobs (num)",
 				io_lib:format(
 					"The number of data syncing jobs to run. Default: ~B."
 					" Each job periodically picks a range and downloads it from peers.",
 					[?DEFAULT_SYNC_JOBS]
 				)},
-			{"new_mining_key", "Generate a new keyfile, apply it as the reward address"},
+			{"header_sync_jobs (num)",
+				io_lib:format(
+					"The number of header syncing jobs to run. Default: ~B."
+					" Each job periodically picks the latest not synced block header"
+					" and downloads it from peers.",
+					[?DEFAULT_HEADER_SYNC_JOBS]
+				)},
+			{"disk_pool_jobs (num)",
+				io_lib:format(
+					"The number of disk pool jobs to run. Default: ~B."
+					" Disk pool jobs scan the disk pool to index no longer pending or"
+					" orphaned chunks, schedule packing for chunks with a sufficient"
+					" number of confirmations and remove abandoned chunks.",
+					[?DEFAULT_DISK_POOL_JOBS]
+				)},
 			{"load_mining_key (file)",
 				"Load the address that mining rewards should be credited to from file."},
 			{"ipfs_pin", "Pin incoming IPFS tagged transactions on your local IPFS node."},
@@ -217,6 +238,19 @@ show_help() ->
 			{"randomx_bulk_hashing_iterations",
 				"The number of hashes RandomX generates before reporting the result back"
 				" to the Arweave miner. The faster CPU hashes, the higher this value should be."
+			},
+			{"disk_cache_size_mb",
+				lists:flatten(io_lib:format(
+					"The maximum size in mebibytes of the disk space allocated for"
+					" storing recent block and transaction headers. Default is ~B.",
+					[?DISK_CACHE_SIZE]
+				)
+			)},
+			{"packing_rate", io_lib:format(
+				"The maximum number of chunks per second to pack or unpack. "
+				"Default: ~B.", [?DEFAULT_PACKING_RATE])},
+			{"debug",
+				"Enable extended logging."
 			}
 		]
 	),
@@ -247,7 +281,9 @@ read_config_from_file(Path) ->
 
 parse_cli_args([], C) -> C;
 parse_cli_args(["mine"|Rest], C) ->
-	parse_cli_args(Rest, C#config { mine = true });
+	parse_cli_args(Rest, C#config { mine = true, pool_mine = false });
+parse_cli_args(["pool_mine"|Rest], C) ->
+	parse_cli_args(Rest, C#config { pool_mine = true, mine = false });
 parse_cli_args(["peer", Peer|Rest], C = #config { peers = Ps }) ->
 	case ar_util:safe_parse_peer(Peer) of
 		{ok, ValidPeer} ->
@@ -268,14 +304,20 @@ parse_cli_args(["port", Port|Rest], C) ->
 	parse_cli_args(Rest, C#config { port = list_to_integer(Port) });
 parse_cli_args(["data_dir", DataDir|Rest], C) ->
 	parse_cli_args(Rest, C#config { data_dir = DataDir });
+parse_cli_args(["shared_data_dir", SharedDataDir|Rest], C) ->
+	parse_cli_args(Rest, C#config { shared_data_dir = SharedDataDir });
+parse_cli_args(["chunk_dir", ChunkDir|Rest], C = #config { chunk_dirs = Dirs }) ->
+	parse_cli_args(Rest, C#config { chunk_dirs = [ ChunkDir | Dirs] });
+parse_cli_args(["no_auto_sync"|Rest], C) ->
+	parse_cli_args(Rest, C#config { auto_sync = false });
 parse_cli_args(["metrics_dir", MetricsDir|Rest], C) ->
 	parse_cli_args(Rest, C#config { metrics_dir = MetricsDir });
 parse_cli_args(["polling", Frequency|Rest], C) ->
 	parse_cli_args(Rest, C#config { polling = list_to_integer(Frequency) });
-parse_cli_args(["clean"|Rest], C) ->
-	parse_cli_args(Rest, C#config { clean = true });
 parse_cli_args(["no_auto_join"|Rest], C) ->
 	parse_cli_args(Rest, C#config { auto_join = false });
+parse_cli_args(["mining_addr", "unclaimed"|Rest], C) ->
+	parse_cli_args(Rest, C#config { mining_addr = unclaimed });
 parse_cli_args(["mining_addr", Addr|Rest], C) ->
 	parse_cli_args(Rest, C#config { mining_addr = ar_util:decode(Addr) });
 parse_cli_args(["max_miners", Num|Rest], C) ->
@@ -288,8 +330,6 @@ parse_cli_args(["stage_two_hashing_threads", Num|Rest], C) ->
 	parse_cli_args(Rest, C#config { stage_two_hashing_threads = list_to_integer(Num) });
 parse_cli_args(["max_emitters", Num|Rest], C) ->
 	parse_cli_args(Rest, C#config { max_emitters = list_to_integer(Num) });
-parse_cli_args(["new_mining_key"|Rest], C)->
-	parse_cli_args(Rest, C#config { new_key = true });
 parse_cli_args(["disk_space", Size|Rest], C) ->
 	parse_cli_args(Rest, C#config { disk_space = (list_to_integer(Size) * 1024 * 1024 * 1024) });
 parse_cli_args(["disk_space_check_frequency", Frequency|Rest], C) ->
@@ -324,8 +364,14 @@ parse_cli_args(["requests_per_minute_limit", Num|Rest], C) ->
 	parse_cli_args(Rest, C#config { requests_per_minute_limit = list_to_integer(Num) });
 parse_cli_args(["max_propagation_peers", Num|Rest], C) ->
 	parse_cli_args(Rest, C#config { max_propagation_peers = list_to_integer(Num) });
+parse_cli_args(["max_block_propagation_peers", Num|Rest], C) ->
+	parse_cli_args(Rest, C#config { max_block_propagation_peers = list_to_integer(Num) });
 parse_cli_args(["sync_jobs", Num|Rest], C) ->
 	parse_cli_args(Rest, C#config { sync_jobs = list_to_integer(Num) });
+parse_cli_args(["header_sync_jobs", Num|Rest], C) ->
+	parse_cli_args(Rest, C#config { header_sync_jobs = list_to_integer(Num) });
+parse_cli_args(["tx_validators", Num|Rest], C) ->
+	parse_cli_args(Rest, C#config { tx_validators = list_to_integer(Num) });
 parse_cli_args(["tx_propagation_parallelization", Num|Rest], C) ->
 	parse_cli_args(Rest, C#config { tx_propagation_parallelization = list_to_integer(Num) });
 parse_cli_args(["max_connections", Num | Rest], C) ->
@@ -342,6 +388,12 @@ parse_cli_args(["max_disk_pool_data_root_buffer_mb", Num | Rest], C) ->
 	parse_cli_args(Rest, C#config { max_disk_pool_data_root_buffer_mb = list_to_integer(Num) });
 parse_cli_args(["randomx_bulk_hashing_iterations", Num | Rest], C) ->
 	parse_cli_args(Rest, C#config { randomx_bulk_hashing_iterations = list_to_integer(Num) });
+parse_cli_args(["disk_cache_size_mb", Num | Rest], C) ->
+	parse_cli_args(Rest, C#config { disk_cache_size = list_to_integer(Num) });
+parse_cli_args(["packing_rate", Num | Rest], C) ->
+	parse_cli_args(Rest, C#config { packing_rate = list_to_integer(Num) });
+parse_cli_args(["debug" | Rest], C) ->
+	parse_cli_args(Rest, C#config { debug = true });
 parse_cli_args([Arg|_Rest], _O) ->
 	io:format("~nUnknown argument: ~s.~n", [Arg]),
 	show_help().
@@ -364,9 +416,9 @@ start(normal, _Args) ->
 	LoggerFormatterConsole = #{
 		legacy_header => false,
 		single_line => true,
-		chars_limit => 512,
+		chars_limit => 2048,
 		max_size => 512,
-		depth => 16,
+		depth => 64,
 		template => [time," [",level,"] ",file,":",line," ",msg,"\n"]
 	},
 	logger:set_handler_config(default, formatter, {logger_formatter, LoggerFormatterConsole}),
@@ -378,11 +430,9 @@ start(normal, _Args) ->
 		max_no_files => 10,
 		max_no_bytes => 51418800 % 10 x 5MB
 	},
-	logger:add_handler(
-		disk_log,
-		logger_disk_log_h,
-		#{ config => LoggerConfigDisk, level => info }
-	),
+	Level = case Config#config.debug of false -> info; _ -> debug end,
+	logger:add_handler(disk_log, logger_disk_log_h,
+			#{ config => LoggerConfigDisk, level => Level }),
 	LoggerFormatterDisk = #{
 		chars_limit => 512,
 		max_size => 512,
@@ -392,9 +442,8 @@ start(normal, _Args) ->
 		template => [time," [",level,"] ",file,":",line," ",msg,"\n"]
 	},
 	logger:set_handler_config(disk_log, formatter, {logger_formatter, LoggerFormatterDisk}),
-	logger:set_application_level(arweave, info),
+	logger:set_application_level(arweave, Level),
 	%% Start the Prometheus metrics subsystem.
-	prometheus_registry:register_collector(prometheus_process_collector),
 	prometheus_registry:register_collector(ar_metrics_collector),
 	%% Register custom metrics.
 	ar_metrics:register(Config#config.metrics_dir),
@@ -414,35 +463,44 @@ start(normal, _Args) ->
 		false -> ok;
 		true  -> app_ipfs:start_pinning()
 	end,
+	set_mining_address(Config),
 	%% Start Arweave.
 	ar_sup:start_link().
 
+validate_trusted_peers(#config{ peers = [] }) ->
+	ok;
 validate_trusted_peers(Config) ->
 	Peers = Config#config.peers,
-	validate_network(Config#config.peers),
-	case lists:member(time_syncing, Config#config.disable) of
-		false ->
-			validate_clock_sync(Peers);
-		true ->
-			ok
+	ValidPeers = filter_valid_peers(Peers),
+	case ValidPeers of
+		[] ->
+			erlang:halt();
+		_ ->
+			application:set_env(arweave, config, Config#config{ peers = ValidPeers }),
+			case lists:member(time_syncing, Config#config.disable) of
+				false ->
+					validate_clock_sync(ValidPeers);
+				true ->
+					ok
+			end
 	end.
 
 %% @doc Verify peers are on the same network as us.
-validate_network(Peers) ->
-	lists:foreach(
+filter_valid_peers(Peers) ->
+	lists:filter(
 		fun(Peer) ->
 			case ar_http_iface_client:get_info(Peer, name) of
 				info_unavailable ->
 					io:format("~n\tPeer ~s is not available.~n~n", [ar_util:format_peer(Peer)]),
-					erlang:halt();
+					false;
 				<<?NETWORK_NAME>> ->
-					ok;
+					true;
 				_ ->
 					io:format(
 						"~n\tPeer ~s does not belong to the network ~s.~n~n",
 						[ar_util:format_peer(Peer), ?NETWORK_NAME]
 					),
-					erlang:halt()
+					false
 			end
 		end,
 		Peers
@@ -497,6 +555,23 @@ log_peer_clock_diff(Peer, Diff) ->
 	WarningArgs = [ar_util:format_peer(Peer), Diff],
 	io:format(Warning, WarningArgs),
 	?LOG_WARNING(Warning, WarningArgs).
+
+set_mining_address(Config) ->
+	MiningAddr =
+		case {Config#config.mining_addr, Config#config.load_key} of
+			{not_set, not_set} ->
+				{_, Pub} = ar_wallet:new_keyfile(),
+				ar_wallet:to_address(Pub);
+			{unclaimed, not_set} ->
+				unclaimed;
+			{Address, _} when is_binary(Address) ->
+				Address;
+			{_, Path} when is_binary(Path) ->
+				{_, Pub} = ar_wallet:load_keyfile(Path),
+				ar_wallet:to_address(Pub)
+		end,
+	application:set_env(arweave, config, Config#config{ mining_addr = MiningAddr }).
+
 shutdown([NodeName]) ->
 	rpc:cast(NodeName, init, stop, []).
 
@@ -525,7 +600,7 @@ warn_if_single_scheduler() ->
 
 %% @doc Run all of the tests associated with the core project.
 tests() ->
-	tests(?CORE_TEST_MODS, #config {}).
+	tests(?CORE_TEST_MODS, #config{ debug = true }).
 
 tests(Mods, Config) when is_list(Mods) ->
 	start_for_tests(Config),

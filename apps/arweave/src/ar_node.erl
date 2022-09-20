@@ -5,27 +5,13 @@
 
 -module(ar_node).
 
--export([
-	get_blocks/0,
-	get_block_index/0, is_in_block_index/1, get_height/0,
-	get_balance/1,
-	get_last_tx/1,
-	get_wallets/1,
-	get_wallet_list_chunk/2,
-	get_current_diff/0, get_diff/0,
-	get_pending_txs/0, get_pending_txs/1, get_ready_for_mining_txs/0, is_a_pending_tx/1,
-	get_current_block_hash/0,
-	get_block_index_entry/1,
-	get_2_0_hash_of_1_0_block/1,
-	is_joined/0,
-	get_block_anchors/0, get_recent_txs_map/0,
-	mine/0,
-	add_tx/1,
-	add_peers/1,
-	set_loss_probability/1,
-	get_mempool_size/0,
-	get_block_shadow_from_cache/1
-]).
+-export([get_recent_block_hash_by_height/1, get_blocks/0, get_block_index/0, is_in_block_index/1,
+		get_height/0, get_balance/1, get_last_tx/1, get_wallets/1, get_wallet_list_chunk/2,
+		get_pending_txs/0, get_pending_txs/1, get_ready_for_mining_txs/0, is_a_pending_tx/1,
+		get_current_usd_to_ar_rate/0, get_current_block_hash/0, get_block_index_entry/1,
+		get_2_0_hash_of_1_0_block/1, is_joined/0, get_block_anchors/0, get_recent_txs_map/0,
+		mine/0, add_tx/1, get_mempool_size/0, get_block_shadow_from_cache/1,
+		get_recent_search_space_upper_bound_by_prev_h/1]).
 
 -include_lib("arweave/include/ar.hrl").
 -include_lib("arweave/include/ar_config.hrl").
@@ -34,6 +20,26 @@
 %%%===================================================================
 %%% API
 %%%===================================================================
+
+%% @doc Return the hash of the block of the given Height. Return not_found
+%% if Height is bigger than the current height or too small.
+get_recent_block_hash_by_height(Height) ->
+	Props =
+		ets:select(
+			node_state,
+			[{{'$1', '$2'},
+				[{'or',
+					{'==', '$1', height},
+					{'==', '$1', block_anchors}}], ['$_']}]
+		),
+	CurrentHeight = proplists:get_value(height, Props),
+	Anchors = proplists:get_value(block_anchors, Props),
+	case Height > CurrentHeight orelse Height =< CurrentHeight - length(Anchors) of
+		true ->
+			not_found;
+		false ->
+			lists:nth(CurrentHeight - Height + 1, Anchors)
+	end.
 
 %% @doc Get the current block index (the list of {block hash, weave size, tx root} triplets).
 get_blocks() ->
@@ -49,11 +55,7 @@ get_block_index() ->
 			[]
 	end.
 
-%% @doc Get pending transactions. This includes:
-%% 1. The transactions currently staying in the priority queue.
-%% 2. The transactions on timeout waiting to be distributed around the network.
-%% 3. The transactions ready to be and being mined.
-%% @end
+%% @doc Get pending transactions.
 get_pending_txs() ->
 	get_pending_txs([]).
 
@@ -72,17 +74,23 @@ get_pending_txs(Opts) ->
 			[{tx_statuses, Map}] = ets:lookup(node_state, tx_statuses),
 			Map;
 		{false, true} ->
-			[{tx_statuses, Map}] = ets:lookup(node_state, tx_statuses),
-			maps:keys(Map);
+			[{tx_priority_set, Set}] = ets:lookup(node_state, tx_priority_set),
+			gb_sets:fold(
+				fun({_Utility, TXID, _Status}, Acc) ->
+					[TXID | Acc]
+				end,
+				[],
+				Set
+			);
 		{false, false} ->
-			[{tx_statuses, Map}] = ets:lookup(node_state, tx_statuses),
-			maps:fold(
-				fun(TXID, _Value, Acc) ->
+			[{tx_priority_set, Set}] = ets:lookup(node_state, tx_priority_set),
+			gb_sets:fold(
+				fun({_Utility, TXID, _Status}, Acc) ->
 					[{{tx, TXID}, TX}] = ets:lookup(node_state, {tx, TXID}),
 					[TX | Acc]
 				end,
 				[],
-				Map
+				Set
 			)
 	end.
 
@@ -92,31 +100,35 @@ is_a_pending_tx(TXID) ->
 	maps:is_key(TXID, Map).
 
 %% @doc Get the list of being mined or ready to be mined transactions.
-%% The list does _not_ include transactions in the priority queue or
-%% those on timeout waiting for network propagation.
-%% @end
+%% The list does _not_ include transactions waiting for network propagation.
 get_ready_for_mining_txs() ->
-	[{tx_statuses, Map}] = ets:lookup(node_state, tx_statuses),
-	maps:fold(
+	[{tx_priority_set, Set}] = ets:lookup(node_state, tx_priority_set),
+	gb_sets:fold(
 		fun
-			(TXID, ready_for_mining, Acc) ->
+			({_Utility, TXID, ready_for_mining}, Acc) ->
 				[{{tx, TXID}, TX}] = ets:lookup(node_state, {tx, TXID}),
 				[TX | Acc];
-			(_, _, Acc) ->
+			(_, Acc) ->
 				Acc
 		end,
 		[],
-		Map
+		Set
 	).
 
 %% @doc Return true if the given block hash is found in the block index.
 is_in_block_index(H) ->
-	[{block_index, BI}] = ets:lookup(node_state, block_index),
-	case lists:search(fun({BH, _, _}) -> BH == H end, BI) of
+	[{block_anchors, Anchors}] = ets:lookup(node_state, block_anchors),
+	case lists:search(fun(BH) -> BH == H end, Anchors) of
 		{value, _} ->
 			true;
 		false ->
-			false
+			[{block_index, BI}] = ets:lookup(node_state, block_index),
+			case lists:search(fun({BH, _, _}) -> BH == H end, BI) of
+				{value, _} ->
+					true;
+				false ->
+					false
+			end
 	end.
 
 %% @doc Get the current block hash.
@@ -189,33 +201,10 @@ is_joined() ->
 			false
 	end.
 
-%% @doc Returns the estimated future difficulty of the currently mined block.
-%% The function name is confusing and needs to be changed.
-%% @end
-get_current_diff() ->
-	Props =
-		ets:select(
-			node_state,
-			[{{'$1', '$2'},
-				[{'or',
-					{'==', '$1', height},
-					{'==', '$1', last_retarget},
-					{'==', '$1', diff}}], ['$_']}]
-		),
-	Height = proplists:get_value(height, Props),
-	Diff = proplists:get_value(diff, Props),
-	LastRetarget = proplists:get_value(last_retarget, Props),
-	ar_retarget:maybe_retarget(
-		Height + 1,
-		Diff,
-		os:system_time(seconds),
-		LastRetarget
-	).
-
-%% @doc Returns the difficulty of the current block (the last applied one).
-get_diff() ->
-	[{diff, Diff}] = ets:lookup(node_state, diff),
-	Diff.
+%% @doc Get the currently estimated USD to AR exchange rate.
+get_current_usd_to_ar_rate() ->
+	[{_, Rate}] = ets:lookup(node_state, usd_to_ar_rate),
+	Rate.
 
 %% @doc Returns a list of block anchors corrsponding to the current state -
 %% the hashes of the recent blocks that can be used in transactions as anchors.
@@ -270,21 +259,45 @@ get_wallet_list_chunk(RootHash, Cursor) ->
 mine() ->
 	gen_server:cast(ar_node_worker, mine).
 
-%% @doc Add a transaction to the node server loop.
-%% If accepted the tx will enter the waiting pool before being mined into the
-%% the next block.
-%% @end
+%% @doc Add a transaction to the memory pool, ready for mining.
 add_tx(TX)->
-	gen_server:cast(ar_node_worker, {add_tx, TX}).
+	ar_events:send(tx, {ready_for_mining, TX}).
 
-%% @doc Request to add a list of peers to the node server loop.
-add_peers(Peer) when not is_list(Peer) ->
-	add_peers([Peer]);
-add_peers(Peers) ->
-	gen_server:cast(ar_node_worker, {add_peers, Peers}).
+%% @doc Return the search space upper bound for the block following the block with the
+%% given hash. Only works for the recent ?STORE_BLOCKS_BEHIND_CURRENT blocks.
+%% Return not_found if the given hash is not found in the block cache.
+get_recent_search_space_upper_bound_by_prev_h(H) ->
+	get_recent_search_space_upper_bound_by_prev_h(H, 0).
 
-%% @doc Set the likelihood that a message will be dropped in transmission.
-%% Used primarily for testing, simulating packet loss.
-%% @end
-set_loss_probability(Prob) ->
-	gen_server:cast(ar_node_worker, {set_loss_probability, Prob}).
+get_recent_search_space_upper_bound_by_prev_h(H, Diff) ->
+	case ar_block_cache:get_block_and_status(block_cache, H) of
+		{_B, on_chain} ->
+			[{_, BI}] = ets:lookup(node_state, recent_block_index),
+			get_recent_search_space_upper_bound_by_prev_h(H, Diff, BI);
+		{#block{ previous_block = PrevH, weave_size = WeaveSize }, _} ->
+			case Diff == ?SEARCH_SPACE_UPPER_BOUND_DEPTH - 1 of
+				true ->
+					WeaveSize;
+				false ->
+					get_recent_search_space_upper_bound_by_prev_h(PrevH, Diff + 1)
+			end;
+		not_found ->
+			?LOG_INFO([{event, prev_block_not_found}, {h, ar_util:encode(H)}, {depth, Diff}]),
+			not_found
+	end.
+
+get_recent_search_space_upper_bound_by_prev_h(H, Diff, [{H, _, _} | _] = BI) ->
+	SearchSpaceUpperBoundDepth = ?SEARCH_SPACE_UPPER_BOUND_DEPTH,
+	Depth = SearchSpaceUpperBoundDepth - Diff,
+	case length(BI) < Depth of
+		true ->
+			element(2, lists:last(BI));
+		false ->
+			element(2, lists:nth(Depth, BI))
+	end;
+get_recent_search_space_upper_bound_by_prev_h(H, Diff, [_ | BI]) ->
+	get_recent_search_space_upper_bound_by_prev_h(H, Diff, BI);
+get_recent_search_space_upper_bound_by_prev_h(H, Diff, []) ->
+	?LOG_INFO([{event, prev_block_not_found_when_scanning_recent_block_index},
+			{h, ar_util:encode(H)}, {depth, Diff}]),
+	not_found.

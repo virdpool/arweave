@@ -6,8 +6,6 @@
 -define(CHUNK_DIR, "chunk_storage").
 
 -define(STORE_CHUNK_STORAGE_STATE_FREQUENCY_MS, 120000).
+-define(SYNC_CHUNK_STORAGE_STATE_FREQUENCY_MS, 2 * 60 * 60 * 1000).
 
--record(state, {
-	sync_record,
-	file_index
-}).
+-define(CHUNK_STORAGE_BUFFER_SIZE, 20 * 1024 * 1024 * 1024). % Same as DISK_DATA_BUFFER_SIZE.

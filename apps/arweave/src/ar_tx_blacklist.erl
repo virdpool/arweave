@@ -8,17 +8,9 @@
 
 -behaviour(gen_server).
 
--export([
-	start_link/0,
-	is_tx_blacklisted/1,
-	is_byte_blacklisted/1,
-	get_next_not_blacklisted_byte/1,
-	notify_about_removed_tx/1,
-	notify_about_removed_tx_data/3,
-	norify_about_orphaned_tx/1,
-	notify_about_added_tx/3,
-	store_state/0
-]).
+-export([start_link/0, start_taking_down/0, is_tx_blacklisted/1, is_byte_blacklisted/1,
+		get_next_not_blacklisted_byte/1, notify_about_removed_tx/1, notify_about_removed_tx_data/3,
+		norify_about_orphaned_tx/1, notify_about_added_tx/3, store_state/0]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
@@ -28,7 +20,7 @@
 -ifdef(DEBUG).
 -define(REFRESH_BLACKLISTS_FREQUENCY_MS, 2000).
 -else.
--define(REFRESH_BLACKLISTS_FREQUENCY_MS, 60 * 60 * 1000).
+-define(REFRESH_BLACKLISTS_FREQUENCY_MS, 10 * 60 * 1000).
 -endif.
 
 %% How long to wait before retrying to compose a blacklist from local and external
@@ -37,7 +29,11 @@
 
 %% How long to wait for the response to the previously requested
 %% header or data removal (takedown) before requesting it for a new tx.
--define(REQUEST_TAKEDOWN_DELAY_MS, 2000).
+-ifdef(DEBUG).
+-define(REQUEST_TAKEDOWN_DELAY_MS, 1000).
+-else.
+-define(REQUEST_TAKEDOWN_DELAY_MS, 30000).
+-endif.
 
 %% The frequency of checking whether the time for the response to
 %% the previously requested takedown is due.
@@ -57,7 +53,11 @@
 	header_takedown_request_timestamp = os:system_time(millisecond),
 	%% The timestamp of the last requested transaction data takedown.
 	%% It is used to throttle the takedown requests.
-	data_takedown_request_timestamp = os:system_time(millisecond)
+	data_takedown_request_timestamp = os:system_time(millisecond),
+	%% A cursor pointing to a TXID in the list of pending unblacklisted transactions.
+	%% Some of them might be orphaned or simply non-existent.
+	pending_restore_cursor = first,
+	unblacklist_timeout = os:system_time(second)
 }).
 
 %%%===================================================================
@@ -66,6 +66,10 @@
 
 start_link() ->
 	gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
+
+%% @doc Start removing blacklisted headers and data, if any.
+start_taking_down() ->
+	gen_server:cast(?MODULE, start_taking_down).
 
 %% @doc Check whether the given transaction is blacklisted.
 is_tx_blacklisted(TXID) ->
@@ -102,7 +106,7 @@ get_next_not_blacklisted_byte(Offset) ->
 notify_about_removed_tx(TXID) ->
 	gen_server:cast(?MODULE, {removed_tx, TXID}).
 
-%% @doc Notify the serveer about the orphaned tx caused by the fork.
+%% @doc Notify the server about the orphaned tx caused by the fork.
 norify_about_orphaned_tx(TXID) ->
 	gen_server:cast(?MODULE, {orphaned_tx, TXID}).
 
@@ -121,14 +125,19 @@ notify_about_added_tx(TXID, End, Start) ->
 init([]) ->
 	ok = initialize_state(),
 	process_flag(trap_exit, true),
+	ok = ar_events:subscribe(tx),
 	gen_server:cast(?MODULE, refresh_blacklist),
-	gen_server:cast(?MODULE, maybe_request_takedown),
 	{ok, _} = timer:apply_interval(?STORE_STATE_FREQUENCY_MS, ?MODULE, store_state, []),
 	{ok, #ar_tx_blacklist_state{}}.
 
 handle_call(Request, _From, State) ->
 	?LOG_ERROR([{event, unhandled_call}, {module, ?MODULE}, {request, Request}]),
 	{reply, ok, State}.
+
+handle_cast(start_taking_down, State) ->
+	gen_server:cast(?MODULE, maybe_restore),
+	gen_server:cast(?MODULE, maybe_request_takedown),
+	{noreply, State};
 
 handle_cast(refresh_blacklist, State) ->
 	case refresh_blacklist() of
@@ -177,6 +186,34 @@ handle_cast(maybe_request_takedown, State) ->
 	),
 	{noreply, State3};
 
+handle_cast(maybe_restore, #ar_tx_blacklist_state{ pending_restore_cursor = Cursor,
+		unblacklist_timeout = UnblacklistTimeout } = State) ->
+	Now = os:system_time(second),
+	ar_util:cast_after(200, ?MODULE, maybe_restore),
+	case UnblacklistTimeout + 30000 < Now of
+		true ->
+			Read =
+				case Cursor of
+					first ->
+						ets:first(ar_tx_blacklist_pending_restore_headers);
+					_ ->
+						ets:next(ar_tx_blacklist_pending_restore_headers, Cursor)
+				end,
+			case Read of
+				'$end_of_table' ->
+					{noreply, State#ar_tx_blacklist_state{ pending_restore_cursor = first,
+							unblacklist_timeout = Now }};
+				TXID ->
+					?LOG_DEBUG([{event, preparing_transaction_unblacklisting},
+							{tx, ar_util:encode(TXID)}]),
+					ar_events:send(tx, {preparing_unblacklisting, TXID}),
+					{noreply, State#ar_tx_blacklist_state{ pending_restore_cursor = TXID,
+							unblacklist_timeout = Now }}
+			end;
+		false ->
+			{noreply, State}
+	end;
+
 handle_cast({removed_tx, TXID}, State) ->
 	case ets:member(ar_tx_blacklist_pending_headers, TXID) of
 		false ->
@@ -224,6 +261,14 @@ handle_cast(Msg, State) ->
 	?LOG_ERROR([{event, unhandled_cast}, {module, ?MODULE}, {message, Msg}]),
 	{noreply, State}.
 
+handle_info({event, tx, {ready_for_unblacklisting, TXID}}, State) ->
+	?LOG_DEBUG([{event, unblacklisting_transaction}, {tx, ar_util:encode(TXID)}]),
+	ets:delete(ar_tx_blacklist_pending_restore_headers, TXID),
+	{noreply, State#ar_tx_blacklist_state{ unblacklist_timeout = os:system_time(second) }};
+
+handle_info({event, tx, _}, State) ->
+	{noreply, State};
+
 handle_info(Info, State) ->
 	?LOG_ERROR([{event, unhandled_info}, {module, ?MODULE}, {message, Info}]),
 	{noreply, State}.
@@ -245,7 +290,8 @@ initialize_state() ->
 		ar_tx_blacklist,
 		ar_tx_blacklist_pending_headers,
 		ar_tx_blacklist_pending_data,
-		ar_tx_blacklist_offsets
+		ar_tx_blacklist_offsets,
+		ar_tx_blacklist_pending_restore_headers
 	],
 	lists:foreach(
 		fun
@@ -318,23 +364,25 @@ refresh_blacklist(Whitelist, Blacklist) ->
 		),
 	lists:foreach(
 		fun(TXID) ->
+			ets:insert(ar_tx_blacklist, [{TXID}]),
 			ets:insert(ar_tx_blacklist_pending_headers, [{TXID}]),
 			ets:insert(ar_tx_blacklist_pending_data, [{TXID}]),
-			ets:insert(ar_tx_blacklist, [{TXID}])
+			ets:delete(ar_tx_blacklist_pending_restore_headers, TXID)
 		end,
 		Removed
 	),
 	lists:foreach(
 		fun(TXID) ->
+			ets:insert(ar_tx_blacklist_pending_restore_headers, [{TXID}]),
 			case ets:lookup(ar_tx_blacklist, TXID) of
 				[{TXID}] ->
 					ok;
 				[{TXID, End, Start}] ->
 					restore_offsets(End, Start)
 			end,
+			ets:delete(ar_tx_blacklist, TXID),
 			ets:delete(ar_tx_blacklist_pending_data, TXID),
-			ets:delete(ar_tx_blacklist_pending_headers, TXID),
-			ets:delete(ar_tx_blacklist, TXID)
+			ets:delete(ar_tx_blacklist_pending_headers, TXID)
 		end,
 		Restored
 	),
@@ -392,13 +440,14 @@ load_from_urls(URLs) ->
 
 load_from_url(URL) ->
 	try
-		{ok, {_Scheme, _UserInfo, Host, Port, Path, Query}} =
-			http_uri:parse(case is_list(URL) of true -> list_to_binary(URL); _ -> URL end),
+		#{ host := Host, path := Path, scheme := Scheme } = M = uri_string:parse(URL),
+		Query = case maps:get(query, M, not_found) of not_found -> <<>>; Q -> [<<"?">>, Q] end,
+		Port = maps:get(port, M, case Scheme of "http" -> 80; "https" -> 443 end),
 		Reply =
 			ar_http:req(#{
 				method => get,
-				peer => {binary_to_list(Host), Port},
-				path => binary_to_list(<<Path/binary, Query/binary>>),
+				peer => {Host, Port},
+				path => binary_to_list(iolist_to_binary([Path, Query])),
 				is_peer_request => false,
 				timeout => 20000,
 				connect_timeout => 1000
@@ -459,7 +508,8 @@ store_state() ->
 		ar_tx_blacklist,
 		ar_tx_blacklist_pending_headers,
 		ar_tx_blacklist_pending_data,
-		ar_tx_blacklist_offsets
+		ar_tx_blacklist_offsets,
+		ar_tx_blacklist_pending_restore_headers
 	],
 	lists:foreach(
 		fun
@@ -484,7 +534,8 @@ close_dets() ->
 		ar_tx_blacklist,
 		ar_tx_blacklist_pending_headers,
 		ar_tx_blacklist_pending_data,
-		ar_tx_blacklist_offsets
+		ar_tx_blacklist_offsets,
+		ar_tx_blacklist_pending_restore_headers
 	],
 	lists:foreach(
 		fun
