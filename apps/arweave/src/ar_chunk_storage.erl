@@ -15,7 +15,9 @@
 -include_lib("eunit/include/eunit.hrl").
 
 -record(state, {
-	file_index
+	auto_sync = true,
+	file_index,
+	file_dir_index
 }).
 
 %%%===================================================================
@@ -39,13 +41,11 @@ put(Offset, Chunk) ->
 %% @doc Open all the storage files. The subsequent calls to get/1 in the
 %% caller process will use the opened file descriptors.
 open_files() ->
-	{ok, Config} = application:get_env(arweave, config),
-	DataDir = Config#config.data_dir,
 	ets:foldl(
-		fun({Key, Filename}, _) ->
+		fun({Key, {Filename, FileDir}}, _) ->
 			case erlang:get({cfile, Key}) of
 				undefined ->
-					Filepath = filename:join([DataDir, ?CHUNK_DIR, Filename]),
+					Filepath = filename:join([FileDir, Filename]),
 					case file:open(Filepath, [read, raw, binary]) of
 						{ok, F} ->
 							erlang:put({cfile, Key}, F);
@@ -101,26 +101,76 @@ repair_chunk(Offset, DataPath) ->
 init([]) ->
 	process_flag(trap_exit, true),
 	{ok, Config} = application:get_env(arweave, config),
-	DataDir = Config#config.data_dir,
-	ok = filelib:ensure_dir(filename:join(DataDir, ?CHUNK_DIR) ++ "/"),
-	FileIndex = read_state(),
-	maps:map(
-		fun(Key, Filename) ->
-			ets:insert(chunk_storage_file_index, {Key, Filename})
+	ChunkDirs = Config#config.chunk_dirs,
+	lists:foreach(
+		fun(Dir) ->
+			ok = filelib:ensure_dir(filename:join(Dir, ?CHUNK_DIR) ++ "/")
 		end,
-		FileIndex
+		ChunkDirs
 	),
-	{ok, _} =
-		timer:apply_interval(
-			?STORE_CHUNK_STORAGE_STATE_FREQUENCY_MS,
-			gen_server,
-			cast,
-			[?MODULE, store_state]
+	FileIndex = read_state(),
+	FileDirIndex =
+		maps:map(
+			fun(_, Filename) ->
+				FilteredDir = lists:filter(
+					fun(Dir) ->
+						Filepath = filename:join([Dir, ?CHUNK_DIR, Filename]),
+						case file:open(Filepath, [read, raw, binary]) of
+							{ok, _} ->
+								true;
+							_ ->
+								false
+						end
+					end,
+					ChunkDirs
+				),
+				case FilteredDir of
+					[] ->
+						{Filename, []};
+					_ ->
+						FileDir = filename:join([lists:nth(1, FilteredDir), ?CHUNK_DIR]),
+						{Filename, FileDir}
+				end
+			end,
+			FileIndex
 		),
-	{ok, #state{ file_index = FileIndex }}.
+	maps:map(
+		fun(Key, {Filename, FileDir}) ->
+			case FileDir of
+				[] ->
+					ok;
+				_ ->
+					ets:insert(chunk_storage_file_index, {Key, {Filename, FileDir}})
+			end
+		end,
+		FileDirIndex
+	),
+	case Config#config.auto_sync of
+		true ->
+			{ok, _} =
+				timer:apply_interval(
+					?STORE_CHUNK_STORAGE_STATE_FREQUENCY_MS,
+					gen_server,
+					cast,
+					[?MODULE, store_state]
+				);
+		false ->
+			{ok, _} =
+				timer:apply_interval(
+					?SYNC_CHUNK_STORAGE_STATE_FREQUENCY_MS,
+					gen_server,
+					cast,
+					[?MODULE, sync_state]
+				)
+	end,
+	{ok, #state{ auto_sync = Config#config.auto_sync, file_index = FileIndex, file_dir_index = FileDirIndex }}.
 
 handle_cast(store_state, State) ->
 	store_state(State),
+	{noreply, State};
+
+handle_cast(sync_state, State) ->
+	sync_state(State),
 	{noreply, State};
 
 handle_cast({cut, Offset}, State) ->
@@ -132,29 +182,35 @@ handle_cast(Cast, State) ->
 	{noreply, State}.
 
 handle_call({put, Offset, Chunk}, _From, State) when byte_size(Chunk) == ?DATA_CHUNK_SIZE ->
-	#state{ file_index = FileIndex } = State,
+	#state{ file_index = FileIndex, file_dir_index = FileDirIndex } = State,
 	Key = get_key(Offset),
-	{Reply, FileIndex2} =
-		case store_chunk(Key, Offset, Chunk, FileIndex) of
-			{ok, Filename} ->
+	{Reply, FileIndex2, FileDirIndex2} =
+		case store_chunk(Key, Offset, Chunk, FileDirIndex) of
+			{ok, {Filename, FileDir}} ->
 				ok = ar_sync_record:add(Offset, Offset - ?DATA_CHUNK_SIZE, ?MODULE),
-				ets:insert(chunk_storage_file_index, {Key, Filename}),
-				{ok, maps:put(Key, Filename, FileIndex)};
+				ets:insert(chunk_storage_file_index, {Key, {Filename, FileDir}}),
+				{ok, maps:put(Key, Filename, FileIndex), maps:put(Key, {Filename, FileDir}, FileDirIndex)};
+			not_found ->
+				{not_found, FileIndex, FileDirIndex};
 			Error ->
 				{Error, FileIndex}
 		end,
-	{reply, Reply, State#state{ file_index = FileIndex2 }};
+	{reply, Reply, State#state{ file_index = FileIndex2, file_dir_index = FileDirIndex2 }};
 
 handle_call({delete, Offset}, _From, State) ->
-	#state{	file_index = FileIndex } = State,
+	#state{	file_dir_index = FileDirIndex } = State,
 	Key = get_key(Offset),
-	Filename = filename(Key, FileIndex),
-	ok = ar_sync_record:delete(Offset, Offset - ?DATA_CHUNK_SIZE, ?MODULE),
-	case delete_chunk(Offset, Key, Filename) of
-		ok ->
-			{reply, ok, State};
-		Error ->
-			{reply, Error, State}
+	case get_filename_and_dir(Key, FileDirIndex) of
+		{Filename, FileDir} ->
+			ok = ar_sync_record:delete(Offset, Offset - ?DATA_CHUNK_SIZE, ?MODULE),
+			case delete_chunk(Offset, Key, Filename, FileDir) of
+				ok ->
+					{reply, ok, State};
+				Error ->
+					{reply, Error, State}
+			end;
+		not_found ->
+			ar:console("Failed to delete chunk")
 	end;
 
 handle_call({repair_chunk, Offset, DataPath}, _From, State) ->
@@ -175,20 +231,16 @@ handle_call({repair_chunk, Offset, DataPath}, _From, State) ->
 			{reply, {ok, removed}, State}
 	end;
 
-handle_call(reset, _, #state{ file_index = FileIndex }) ->
-	{ok, Config} = application:get_env(arweave, config),
-	DataDir = Config#config.data_dir,
-	DataDir = "data_test_master",
-	ChunkDir = filename:join(DataDir, ?CHUNK_DIR),
+handle_call(reset, _, #state{ file_dir_index = FileDirIndex }) ->
 	maps:map(
-		fun(_Key, Filename) ->
-			file:delete(filename:join(ChunkDir, Filename))
+		fun(_Key, {Filename, FileDir}) ->
+			file:delete(filename:join(FileDir, Filename))
 		end,
-		FileIndex
+		FileDirIndex
 	),
 	ok = ar_sync_record:cut(0, ?MODULE),
 	erlang:erase(),
-	{reply, ok, #state{ file_index = #{} }};
+	{reply, ok, #state{ file_index = #{}, file_dir_index = #{} }};
 
 handle_call(Request, _From, State) ->
 	?LOG_WARNING("event: unhandled_call, request: ~p", [Request]),
@@ -211,22 +263,68 @@ get_key(Offset) ->
 	StartOffset = Offset - ?DATA_CHUNK_SIZE,
 	StartOffset - StartOffset rem ?CHUNK_GROUP_SIZE.
 
-store_chunk(Key, Offset, Chunk, FileIndex) ->
-	Filename = filename(Key, FileIndex),
-	{ok, Config} = application:get_env(arweave, config),
-	Dir = filename:join(Config#config.data_dir, ?CHUNK_DIR),
-	Filepath = filename:join(Dir, Filename),
-	store_chunk(Key, Offset, Chunk, Filename, Filepath).
-
-filename(Key, FileIndex) ->
-	case maps:get(Key, FileIndex, not_found) of
+store_chunk(Key, Offset, Chunk, FileDirIndex) ->
+	case get_filename_and_dir(Key, FileDirIndex) of
+		{Filename, FileDir} ->
+			store_chunk(Key, Offset, Chunk, Filename, FileDir);
 		not_found ->
-			integer_to_binary(Key);
-		Filename ->
-			Filename
+			ar:console("The node has stopped storing new chunk group. Add more disk space if you wish to store more data.~n"),
+			?LOG_INFO([{event, ar_chunk_storage_stopped_storing}, {reason, little_disk_space_left}]),
+			not_found
 	end.
 
-store_chunk(Key, Offset, Chunk, Filename, Filepath) ->
+get_filename_and_dir(Key, FileDirIndex) ->
+	case filename_and_dir(Key, FileDirIndex) of
+		{not_found, Filename} ->
+			{ok, Config} = application:get_env(arweave, config),
+			Dirs = [filename:join(Dir, ?CHUNK_DIR) || Dir<-Config#config.chunk_dirs],
+			ShuffledDirs = lists:sort(fun(_, _) -> rand:uniform() > 0.5 end, Dirs),
+			case select_path(ShuffledDirs, FileDirIndex) of
+				{ok, FileDir} ->
+					{Filename, FileDir};
+				[] ->
+					not_found
+			end;
+		{ok, {Filename, FileDir}} ->
+			case ar_storage:get_free_space2(FileDir) > ?CHUNK_STORAGE_BUFFER_SIZE of
+				true ->
+					{Filename, FileDir};
+				false ->
+					not_found
+			end
+	end.
+
+filename_and_dir(Key, FileDirIndex) ->
+	case maps:get(Key, FileDirIndex, not_found) of
+		not_found ->
+			{not_found, integer_to_binary(Key)};
+		{Filename, FileDir}  ->
+			{ok, {Filename, FileDir}}
+	end.
+
+select_path([], _) ->
+	[];
+select_path([Dir | Dirs], FileDirIndex) when is_list(Dir) ->
+	FileInDir = maps:filter(
+		fun(_, {_, FileDir}) ->
+			case is_binary(FileDir) of
+				true -> string:equal(binary_to_list(FileDir), Dir);
+				false -> string:equal(FileDir, Dir)
+			end
+		end,
+		FileDirIndex
+	),
+	case ar_storage:get_free_space2(Dir) > ?CHUNK_STORAGE_BUFFER_SIZE of
+		true ->
+			{ok, Dir};
+		false ->
+			select_path(Dirs, FileDirIndex)
+	end;
+select_path([Dir | Dirs], FileDirIndex) when is_binary(Dir) ->
+	select_path([binary_to_list(Dir) | Dirs], FileDirIndex).
+
+store_chunk(Key, Offset, Chunk, Filename, FileDir) ->
+	Filepath = filename:join(FileDir, Filename),
 	case erlang:get({write_handle, Filename}) of
 		undefined ->
 			case file:open(Filepath, [read, write, raw]) of
@@ -240,18 +338,19 @@ store_chunk(Key, Offset, Chunk, Filename, Filepath) ->
 					Error;
 				{ok, F} ->
 					erlang:put({write_handle, Filename}, F),
-					store_chunk2(Key, Offset, Chunk, Filename, Filepath, F)
+					store_chunk2(Key, Offset, Chunk, Filename, FileDir, F)
 			end;
 		F ->
-			store_chunk2(Key, Offset, Chunk, Filename, Filepath, F)
+			store_chunk2(Key, Offset, Chunk, Filename, FileDir, F)
 	end.
 
-store_chunk2(Key, Offset, Chunk, Filename, Filepath, F) ->
+store_chunk2(Key, Offset, Chunk, Filename, FileDir, F) ->
 	StartOffset = Offset - ?DATA_CHUNK_SIZE,
 	LeftChunkBorder = StartOffset - StartOffset rem ?DATA_CHUNK_SIZE,
 	ChunkOffset = StartOffset - LeftChunkBorder,
 	RelativeOffset = LeftChunkBorder - Key,
 	Position = RelativeOffset + ?OFFSET_SIZE * (RelativeOffset div ?DATA_CHUNK_SIZE),
+	Filepath = filename:join(FileDir, Filename),
 	ChunkOffsetBinary =
 		case ChunkOffset of
 			0 ->
@@ -272,13 +371,11 @@ store_chunk2(Key, Offset, Chunk, Filename, Filepath, F) ->
 			]),
 			Error;
 		ok ->
-			{ok, Filename}
+			{ok, {Filename, FileDir}}
 	end.
 
-delete_chunk(Offset, Key, Filename) ->
-	{ok, Config} = application:get_env(arweave, config),
-	Dir = filename:join(Config#config.data_dir, ?CHUNK_DIR),
-	Filepath = filename:join(Dir, Filename),
+delete_chunk(Offset, Key, Filename, FileDir) ->
+	Filepath = filename:join(FileDir, Filename),
 	case file:open(Filepath, [read, write, raw]) of
 		{ok, F} ->
 			StartOffset = Offset - ?DATA_CHUNK_SIZE,
@@ -311,17 +408,15 @@ get(Byte, Start, Key) ->
 			case ets:lookup(chunk_storage_file_index, Key) of
 				[] ->
 					not_found;
-				[{_, Filename}] ->
-					read_chunk(Byte, Start, Key, Filename)
+				[{_, {Filename, FileDir}}] ->
+					read_chunk(Byte, Start, Key, Filename, FileDir)
 			end;
 		File ->
 			read_chunk2(Byte, Start, Key, File)
 	end.
 
-read_chunk(Byte, Start, Key, Filename) ->
-	{ok, Config} = application:get_env(arweave, config),
-	DataDir = Config#config.data_dir,
-	Filepath = filename:join([DataDir, ?CHUNK_DIR, Filename]),
+read_chunk(Byte, Start, Key, Filename, FileDir) ->
+	Filepath = filename:join([FileDir, Filename]),
 	case file:open(Filepath, [read, raw, binary]) of
 		{error, enoent} ->
 			not_found;
@@ -383,7 +478,9 @@ close_files([]) ->
 	ok.
 
 read_state() ->
-	case ar_storage:read_term(chunk_storage_index) of
+	{ok, Config} = application:get_env(arweave, config),
+	SharedDataDir = Config#config.shared_data_dir,
+	case ar_storage:read_term(SharedDataDir, chunk_storage_index) of
 		{ok, {SyncRecord, FileIndex}} ->
 			ok = ar_sync_record:set(SyncRecord, ?MODULE),
 			FileIndex;
@@ -393,8 +490,12 @@ read_state() ->
 			#{}
 	end.
 
+store_state(#state{ auto_sync = false }) ->
+	ok;
 store_state(#state{ file_index = FileIndex }) ->
-	case ar_storage:write_term(chunk_storage_index, FileIndex) of
+	{ok, Config} = application:get_env(arweave, config),
+	SharedDataDir = Config#config.shared_data_dir,
+	case ar_storage:write_term(SharedDataDir, chunk_storage_index, FileIndex) of
 		{error, Reason} ->
 			?LOG_ERROR([
 				{event, chunk_storage_failed_to_persist_state},
@@ -402,6 +503,57 @@ store_state(#state{ file_index = FileIndex }) ->
 			]);
 		ok ->
 			ok
+	end.
+
+sync_state(#state{ auto_sync = false } = State) ->
+	#state{ file_index = FileIndex, file_dir_index = FileDirIndex } = State,
+	{ok, Config} = application:get_env(arweave, config),
+	ChunkDirs = Config#config.chunk_dirs,
+	FileIndex2 = read_state(),
+	Keys = maps:keys(FileIndex),
+	AddedFileIndex = maps:without(Keys, FileIndex2),
+	case map_size(AddedFileIndex) == 0 of
+		true ->
+			{ok, State};
+		false ->
+			AddedFileDirIndex =
+				maps:map(
+					fun(_, Filename) ->
+						FilteredDir = lists:filter(
+							fun(Dir) ->
+								Filepath = filename:join([Dir, ?CHUNK_DIR, Filename]),
+								case file:open(Filepath, [read, raw, binary]) of
+									{ok, _} ->
+										true;
+									_ ->
+										false
+								end
+							end,
+							ChunkDirs
+						),
+						case FilteredDir of
+							[] ->
+								{Filename, []};
+							_ ->
+								FileDir = filename:join([lists:nth(1, FilteredDir), ?CHUNK_DIR]),
+								{Filename, FileDir}
+						end
+					end,
+					AddedFileIndex
+				),
+			FileDirIndex2 = maps:merge(FileDirIndex, AddedFileDirIndex),
+			maps:map(
+				fun(Key, {Filename, FileDir}) ->
+					case FileDir of
+						[] ->
+							ok;
+						_ ->
+							ets:insert(chunk_storage_file_index, {Key, {Filename, FileDir}})
+					end
+				end,
+				AddedFileDirIndex
+			),
+			{ok, State#state{ file_index = FileIndex2, file_dir_index = FileDirIndex2 }}
 	end.
 
 sync_and_close_files() ->

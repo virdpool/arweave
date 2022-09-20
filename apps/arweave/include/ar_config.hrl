@@ -90,6 +90,9 @@
 	pool_mine = false,
 	peers = [],
 	data_dir = ".",
+	shared_data_dir = ".",
+	chunk_dirs = [],
+	auto_sync = true,
 	metrics_dir = ?METRICS_DIR,
 	polling = ?DEFAULT_POLLING_INTERVAL, % Polling frequency in seconds.
 	auto_join = true,

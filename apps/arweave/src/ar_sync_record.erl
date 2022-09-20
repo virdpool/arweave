@@ -10,6 +10,7 @@
 -export([init/1, handle_cast/2, handle_call/3, handle_info/2, terminate/2]).
 
 -include_lib("arweave/include/ar.hrl").
+-include_lib("arweave/include/ar_config.hrl").
 -include_lib("arweave/include/ar_data_sync.hrl").
 -include_lib("arweave/include/ar_data_discovery.hrl").
 
@@ -33,7 +34,17 @@
 -define(STORE_SYNC_RECORD_FREQUENCY_MS, 60 * 1000).
 -endif.
 
+%% The frequency of get sync records from disk.
+-ifdef(DEBUG).
+-define(GET_SYNC_RECORD_FREQUENCY_MS, 1000).
+-else.
+-define(GET_SYNC_RECORD_FREQUENCY_MS, 2 * 60 * 60 * 1000).
+-endif.
+
 -record(state, {
+	%% Specify whether automatically sync the weave.
+	%% If false, do not write rocksdb.
+	auto_sync,
 	%% A map ID => Intervals
 	%% where Intervals is a set of non-overlapping intervals
 	%% of global byte offsets {End, Start} denoting some synced
@@ -76,7 +87,7 @@ set(SyncRecord, ID) ->
 
 %% @doc Add the given set of intervals to the record
 %% with the given Type and ID. Store the changes on disk
-%% before, returning ok.
+%% before returning ok.
 set(SyncRecord, Type, ID) ->
 	case catch gen_server:call(?MODULE, {set, SyncRecord, Type, ID}, infinity) of
 		{'EXIT', {timeout, {gen_server, call, _}}} ->
@@ -88,7 +99,7 @@ set(SyncRecord, Type, ID) ->
 %% @doc Add the given interval to the record with the
 %% given ID. Store the changes on disk before returning ok.
 add(End, Start, ID) ->
-	case catch gen_server:call(?MODULE, {add, End, Start, ID}, 10000) of
+	case catch gen_server:call(?MODULE, {add, End, Start, ID}, 15000) of
 		{'EXIT', {timeout, {gen_server, call, _}}} ->
 			{error, timeout};
 		Reply ->
@@ -121,7 +132,7 @@ delete(End, Start, ID) ->
 %% Offset from the record. Store the changes on disk
 %% before returning ok.
 cut(Offset, ID) ->
-	case catch gen_server:call(?MODULE, {cut, Offset, ID}, 10000) of
+	case catch gen_server:call(?MODULE, {cut, Offset, ID}, 15000) of
 		{'EXIT', {timeout, {gen_server, call, _}}} ->
 			{error, timeout};
 		Reply ->
@@ -172,7 +183,7 @@ is_recorded(Offset, Type, ID) ->
 %% ignored. If random_subset key is not present, the start key must be provided.
 %% @end
 get_record(Args, ID) ->
-	case catch gen_server:call(?MODULE, {get_record, Args, ID}, 10000) of
+	case catch gen_server:call(?MODULE, {get_record, Args, ID}, 50000) of
 		{'EXIT', {timeout, {gen_server, call, _}}} ->
 			{error, timeout};
 		Reply ->
@@ -213,7 +224,14 @@ get_interval(Offset, ID) ->
 
 init([]) ->
 	process_flag(trap_exit, true),
-	{ok, StateDB} = ar_kv:open_without_column_families("ar_sync_record_db", []),
+	{ok, Config} = application:get_env(arweave, config),
+	AutoSync = Config#config.auto_sync,
+	{ok, StateDB} = case AutoSync of
+										true ->
+											ar_kv:open_without_column_families("ar_sync_record_db", []);
+										false ->
+											ar_kv:open_readonly_without_column_families("ar_sync_record_db", [])
+									end,
 	{SyncRecordByID, SyncRecordByIDType, WAL} = read_sync_records(StateDB),
 	SyncBucketsByID = maps:map(
 		fun(ID, SyncRecord) ->
@@ -228,8 +246,14 @@ init([]) ->
 	),
 	initialize_sync_record_by_id_type_ets(SyncRecordByIDType),
 	gen_server:cast(?MODULE, {update_sync_buckets, []}),
-	gen_server:cast(?MODULE, store_state),
+	case AutoSync of
+		true ->
+			gen_server:cast(?MODULE, store_state);
+		false ->
+			gen_server:cast(?MODULE, sync_state)
+	end,
 	{ok, #state{
+		auto_sync = AutoSync,
 		state_db = StateDB,
 		sync_record_by_id = SyncRecordByID,
 		sync_record_by_id_type = SyncRecordByIDType,
@@ -436,6 +460,12 @@ handle_cast(store_state, State) ->
 		?STORE_SYNC_RECORD_FREQUENCY_MS, gen_server, cast, [?MODULE, store_state]),
 	{noreply, State2};
 
+handle_cast(sync_state, State) ->
+	{_, State2} = sync_state(State),
+	timer:apply_after(
+		?GET_SYNC_RECORD_FREQUENCY_MS, gen_server, cast, [?MODULE, sync_state]),
+	{noreply, State2};
+
 handle_cast(Cast, State) ->
 	?LOG_WARNING("event: unhandled_cast, cast: ~p", [Cast]),
 	{noreply, State}.
@@ -613,6 +643,35 @@ store_state(State) ->
 			{ok, State#state{ wal = 0 }}
 	end.
 
+sync_state(State) ->
+	{ok, StateDB} = ar_kv:open_readonly_without_column_families("ar_sync_record_db", []),
+	{SyncRecordByID, SyncRecordByIDType, _} = read_sync_records(StateDB),
+	SyncBucketsByID = maps:map(
+		fun(ID, SyncRecord) ->
+			ar_ets_intervals:init_from_gb_set(ID, SyncRecord),
+			SyncBuckets = ar_sync_buckets:from_intervals(SyncRecord),
+			{SyncBuckets2, SerializedSyncBuckets} = ar_sync_buckets:serialize(SyncBuckets,
+				?MAX_SYNC_BUCKETS_SIZE),
+			ets:insert(?MODULE, {{serialized_sync_buckets, ID}, SerializedSyncBuckets}),
+			SyncBuckets2
+		end,
+		SyncRecordByID
+	),
+	initialize_sync_record_by_id_type_ets(SyncRecordByIDType),
+	SyncRecord = maps:get(ar_data_sync, SyncRecordByID, ar_intervals:new()),
+	prometheus_gauge:set(v2_index_data_size, ar_intervals:sum(SyncRecord)),
+	maps:map(
+		fun	({ar_data_sync, Type}, TypeRecord) ->
+			prometheus_gauge:set(v2_index_data_size_by_packing, [Type],
+				ar_intervals:sum(TypeRecord));
+			(_, _) ->
+				ok
+		end,
+		SyncRecordByIDType
+	),
+	State2 = State#state{ state_db = StateDB, sync_record_by_id = SyncRecordByID, sync_record_by_id_type = SyncRecordByIDType, sync_buckets_by_id = SyncBucketsByID },
+	{ok, State2}.
+
 get_or_create_type_tid(IDType) ->
 	case ets:lookup(sync_records, IDType) of
 		[] ->
@@ -623,6 +682,8 @@ get_or_create_type_tid(IDType) ->
 			TID2
 	end.
 
+update_write_ahead_log(_, _, #state{ auto_sync = false } = State) ->
+	{ok, State};
 update_write_ahead_log(OpParams, StateDB, State) ->
 	#state{
 		wal = WAL

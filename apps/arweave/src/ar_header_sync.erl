@@ -48,23 +48,37 @@ init([]) ->
 	process_flag(trap_exit, true),
 	ok = ar_events:subscribe(tx),
 	{ok, Config} = application:get_env(arweave, config),
-	{ok, DB} = ar_kv:open("ar_header_sync_db"),
+	SharedDataDir = Config#config.shared_data_dir,
+	{ok, DB} =
+		case Config#config.auto_sync of
+			true ->
+				ar_kv:open("ar_header_sync_db");
+			false ->
+				ar_kv:open_readonly_without_column_families("ar_header_sync_db", [])
+		end,
 	{SyncRecord, LastHeight, CurrentBI} =
-		case ar_storage:read_term(header_sync_state) of
+		case ar_storage:read_term(SharedDataDir, header_sync_state) of
 			not_found ->
 				{ar_intervals:new(), -1, []};
 			{ok, StoredState} ->
 				StoredState
 		end,
-	gen_server:cast(?MODULE, check_space_alarm),
-	gen_server:cast(?MODULE, check_space),
-	lists:foreach(
-		fun(_) ->
-			gen_server:cast(?MODULE, process_item)
-		end,
-		lists:seq(1, Config#config.header_sync_jobs)
-	),
-	gen_server:cast(?MODULE, store_sync_state),
+	case Config#config.auto_sync of
+		true ->
+			gen_server:cast(?MODULE, check_space_alarm),
+			gen_server:cast(?MODULE, check_space),
+			lists:foreach(
+				fun(_) ->
+					gen_server:cast(?MODULE, process_item)
+				end,
+				lists:seq(1, Config#config.header_sync_jobs)
+			),
+			gen_server:cast(?MODULE, store_sync_state);
+		false ->
+			gen_server:cast(?MODULE, get_sync_state),
+			ar:console("The node has stopped syncing headers - no_auto_sync is set true.~n"),
+			?LOG_INFO([{event, ar_header_sync_stopped_syncing}, {reason, no_auto_sync}])
+	end,
 	ets:insert(?MODULE, {synced_blocks, ar_intervals:sum(SyncRecord)}),
 	{ok,
 		#{
@@ -75,7 +89,8 @@ init([]) ->
 			queue => queue:new(),
 			last_picked => LastHeight,
 			disk_full => false,
-			sync_disk_space => have_free_space()
+			sync_disk_space => have_free_space(),
+			auto_sync => Config#config.auto_sync
 		}}.
 
 handle_cast({join, BI, Blocks}, State) ->
@@ -83,7 +98,8 @@ handle_cast({join, BI, Blocks}, State) ->
 		db := DB,
 		last_height := LastHeight,
 		block_index := CurrentBI,
-		sync_record := SyncRecord
+		sync_record := SyncRecord,
+		auto_sync := AutoSync
 	} = State,
 	LastHeight2 = length(BI) - 1,
 	State2 =
@@ -104,7 +120,12 @@ handle_cast({join, BI, Blocks}, State) ->
 				%% Delete from the kv store only after the sync record is saved - no matter
 				%% what happens to the process, if a height is in the record, it must be present
 				%% in the kv store.
-				ok = ar_kv:delete_range(DB, << (Height + 1):256 >>, << (LastHeight + 1):256 >>),
+				case AutoSync of
+					true ->
+						ok = ar_kv:delete_range(DB, << (Height + 1):256 >>, << (LastHeight + 1):256 >>);
+					false ->
+						ok
+				end,
 				S
 		end,
 	State4 =
@@ -124,7 +145,8 @@ handle_cast({add_tip_block, #block{ height = Height } = B, RecentBI}, State) ->
 		db := DB,
 		sync_record := SyncRecord,
 		block_index := CurrentBI,
-		last_height := CurrentHeight
+		last_height := CurrentHeight,
+		auto_sync := AutoSync
 	} = State,
 	BaseHeight = get_base_height(CurrentBI, CurrentHeight, RecentBI),
 	State2 = State#{
@@ -133,19 +155,26 @@ handle_cast({add_tip_block, #block{ height = Height } = B, RecentBI}, State) ->
 		last_height => Height
 	},
 	State3 = add_block(B, State2),
-	case store_sync_state(State3) of
-		ok ->
-			%% Delete from the kv store only after the sync record is saved - no matter
-			%% what happens to the process, if a height is in the record, it must be present
-			%% in the kv store.
-			ok = ar_kv:delete_range(DB, << (BaseHeight + 1):256 >>,
-					<< (CurrentHeight + 1):256 >>),
-			{noreply, State3#{ disk_full => false }};
-		{error, enospc} ->
-			{noreply, State#{ disk_full => true }}
+	case AutoSync of
+		true ->
+			case store_sync_state(State3) of
+				ok ->
+					%% Delete from the kv store only after the sync record is saved - no matter
+					%% what happens to the process, if a height is in the record, it must be present
+					%% in the kv store.
+					ok = ar_kv:delete_range(DB, << (BaseHeight + 1):256 >>,
+						<< (CurrentHeight + 1):256 >>),
+					{noreply, State3#{ disk_full => false }};
+				{error, enospc} ->
+					{noreply, State#{ disk_full => true }}
+			end;
+		false ->
+			{noreply, State3}
 	end;
 
 handle_cast({add_historical_block, _}, #{ sync_disk_space := false } = State) ->
+	{noreply, State};
+handle_cast({add_historical_block, _}, #{ auto_sync := false } = State) ->
 	{noreply, State};
 handle_cast({add_historical_block, B}, State) ->
 	State2 = add_block(B, State),
@@ -183,6 +212,8 @@ handle_cast(check_space, State) ->
 
 handle_cast(process_item, #{ sync_disk_space := false } = State) ->
 	ar_util:cast_after(?CHECK_AFTER_SYNCED_INTERVAL_MS, ?MODULE, process_item),
+	{noreply, State};
+handle_cast(process_item, #{ auto_sync := false } = State) ->
 	{noreply, State};
 handle_cast(process_item, State) ->
 	#{
@@ -246,6 +277,11 @@ handle_cast(store_sync_state, State) ->
 		{error, enospc} ->
 			{noreply, State#{ disk_full => true }}
 	end;
+
+handle_cast(get_sync_state, State) ->
+	State2 = get_sync_state(State),
+	ar_util:cast_after(?GET_HEADER_STATE_FREQUENCY_MS, ?MODULE, store_sync_state),
+	{noreply, State2};
 
 handle_cast(Msg, State) ->
 	?LOG_ERROR([{event, unhandled_cast}, {module, ?MODULE}, {message, Msg}]),
@@ -311,11 +347,36 @@ terminate(Reason, State) ->
 %%%===================================================================
 
 store_sync_state(State) ->
-	#{ sync_record := SyncRecord, last_height := LastHeight, block_index := BI } = State,
+	#{ sync_record := SyncRecord, last_height := LastHeight, block_index := BI, auto_sync := AutoSync } = State,
 	SyncedCount = ar_intervals:sum(SyncRecord),
 	prometheus_gauge:set(synced_blocks, SyncedCount),
 	ets:insert(?MODULE, {synced_blocks, SyncedCount}),
-	ar_storage:write_term(header_sync_state, {SyncRecord, LastHeight, BI}).
+	{ok, Config} = application:get_env(arweave, config),
+	SharedDataDir = Config#config.shared_data_dir,
+	case AutoSync of
+		true ->
+			ar_storage:write_term(SharedDataDir, header_sync_state, {SyncRecord, LastHeight, BI});
+		false ->
+			ok
+	end.
+
+get_sync_state(State) ->
+	{ok, Config} = application:get_env(arweave, config),
+	SharedDataDir = Config#config.shared_data_dir,
+	{SyncRecord, LastHeight, CurrentBI} =
+		case ar_storage:read_term(SharedDataDir, header_sync_state) of
+			not_found ->
+				{ar_intervals:new(), -1, []};
+			{ok, StoredState} ->
+				StoredState
+		end,
+	State2 = State#{
+		sync_record => SyncRecord,
+		last_height => LastHeight,
+		block_index => CurrentBI
+	},
+	ets:insert(?MODULE, {synced_blocks, ar_intervals:sum(SyncRecord)}),
+	State2.
 
 get_base_height([{H, _, _} | CurrentBI], CurrentHeight, RecentBI) ->
 	case lists:search(fun({BH, _, _}) -> BH == H end, RecentBI) of
@@ -333,6 +394,8 @@ add_block(B, #{ sync_disk_space := false } = State) ->
 			?LOG_ERROR([{event, failed_to_record_block_confirmations},
 				{reason, io_lib:format("~p", [Error])}])
 	end,
+	State;
+add_block(_, #{ auto_sync := false } = State) ->
 	State;
 add_block(B, State) ->
 	#{ db := DB, sync_record := SyncRecord } = State,
@@ -358,10 +421,13 @@ add_block(B, State) ->
 	end.
 
 have_free_space() ->
+	{ok, Config} = application:get_env(arweave, config),
+	ChunkDirs = Config#config.chunk_dirs,
+	SharedDataDir = Config#config.shared_data_dir,
 	ar_storage:get_free_space(".") > ?DISK_HEADERS_BUFFER_SIZE
 		%% RocksDB and the chunk storage contain v1 data, which is part of the headers.
-		andalso ar_storage:get_free_space(?ROCKS_DB_DIR) > ?DISK_HEADERS_BUFFER_SIZE
-			andalso ar_storage:get_free_space(?CHUNK_DIR) > ?DISK_HEADERS_BUFFER_SIZE.
+		andalso ar_storage:get_free_space2(filename:join(SharedDataDir, ?ROCKS_DB_DIR)) > ?DISK_HEADERS_BUFFER_SIZE
+			andalso lists:any(fun(Dir) -> ar_storage:get_free_space2(filename:join(Dir, ?CHUNK_DIR)) > ?DISK_HEADERS_BUFFER_SIZE end, ChunkDirs).
 
 %% @doc Pick the biggest height smaller than LastPicked from outside the sync record.
 pick_unsynced_block(LastPicked, SyncRecord) ->

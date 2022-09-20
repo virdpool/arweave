@@ -121,6 +121,8 @@ get_chunk(Offset, #{ packing := Packing } = Options) ->
 	case ar_sync_record:is_recorded(Offset, ?MODULE) of
 		false ->
 			{error, chunk_not_found};
+		true ->
+			{error, chunk_not_found};
 		{true, StoredPacking} ->
 			Pack = maps:get(pack, Options, true),
 			case {Pack, Packing == StoredPacking} of
@@ -228,61 +230,75 @@ init([]) ->
 		disk_pool_cursor = first,
 		disk_pool_threshold = get_disk_pool_threshold(CurrentBI),
 		packing_2_5_threshold = Packing_2_5_Threshold,
+		auto_sync = Config#config.auto_sync,
 		repacking_cursor = 0,
 		strict_data_split_threshold = StrictDataSplitThreshold,
 		packing_disabled = lists:member(packing, Config#config.disable)
 	},
 	ets:insert(ar_data_sync_state, {strict_data_split_threshold, StrictDataSplitThreshold}),
-	repair_genesis_block_index(State2),
-	gen_server:cast(?MODULE, check_space),
-	gen_server:cast(?MODULE, check_space_warning),
-	gen_server:cast(?MODULE, collect_sync_intervals),
-	lists:foreach(
-		fun(_SyncingJobNumber) ->
-			gen_server:cast(?MODULE, sync_random_interval)
-		end,
-		lists:seq(1, Config#config.sync_jobs)
-	),
-	gen_server:cast(?MODULE, update_disk_pool_data_roots),
-	lists:foreach(
-		fun(_DiskPoolJobNumber) ->
-			gen_server:cast(?MODULE, process_disk_pool_item)
-		end,
-		lists:seq(1, Config#config.disk_pool_jobs)
-	),
-	gen_server:cast(?MODULE, store_sync_state),
-	gen_server:cast(?MODULE, repack_stored_chunks),
+	case Config#config.auto_sync of
+		true ->
+			repair_genesis_block_index(State2),
+			gen_server:cast(?MODULE, check_space),
+			gen_server:cast(?MODULE, check_space_warning),
+			gen_server:cast(?MODULE, collect_sync_intervals),
+			lists:foreach(
+				fun(_SyncingJobNumber) ->
+					gen_server:cast(?MODULE, sync_random_interval)
+				end,
+				lists:seq(1, Config#config.sync_jobs)
+			),
+			gen_server:cast(?MODULE, update_disk_pool_data_roots),
+			lists:foreach(
+				fun(_DiskPoolJobNumber) ->
+					gen_server:cast(?MODULE, process_disk_pool_item)
+				end,
+				lists:seq(1, Config#config.disk_pool_jobs)
+			),
+			gen_server:cast(?MODULE, store_sync_state),
+			gen_server:cast(?MODULE, repack_stored_chunks);
+		false ->
+			gen_server:cast(?MODULE, get_sync_state),
+			ar:console("The node has stopped syncing data - no_auto_sync is set true.~n"),
+			?LOG_INFO([{event, ar_data_sync_stopped_syncing}, {reason, no_auto_sync}])
+	end,
 	{ok, State2}.
 
 handle_cast({join, Packing_2_5_Threshold, StrictDataSplitThreshold, BI}, State) ->
 	#sync_data_state{
 		data_root_offset_index = DataRootOffsetIndex,
 		disk_pool_data_roots = DiskPoolDataRoots,
-		block_index = CurrentBI
+		block_index = CurrentBI,
+		auto_sync = AutoSync
 	} = State,
 	[{_, WeaveSize, _} | _] = BI,
 	DiskPoolDataRoots2 =
-		case {CurrentBI, ar_util:get_block_index_intersection(BI, CurrentBI)} of
-			{[], _Intersection} ->
-				ok = data_root_offset_index_from_block_index(DataRootOffsetIndex, BI, 0),
-				DiskPoolDataRoots;
-			{_CurrentBI, none} ->
-				throw(last_stored_block_index_has_no_intersection_with_the_new_one);
-			{_CurrentBI, {{H, Offset, _TXRoot}, _Height}} ->
-				PreviousWeaveSize = element(2, hd(CurrentBI)),
-				{ok, OrphanedDataRoots} = remove_orphaned_data(State, Offset,
-						PreviousWeaveSize),
-				ok = data_root_offset_index_from_block_index(
-					DataRootOffsetIndex,
-					lists:takewhile(fun({BH, _, _}) -> BH /= H end, BI),
-					Offset
-				),
-				ar_chunk_storage:cut(Offset),
-				ar_sync_record:cut(Offset, ?MODULE),
-				reset_orphaned_data_roots_disk_pool_timestamps(
-					DiskPoolDataRoots,
-					OrphanedDataRoots
-				)
+		case AutoSync of
+			true ->
+				case {CurrentBI, ar_util:get_block_index_intersection(BI, CurrentBI)} of
+					{[], _Intersection} ->
+						ok = data_root_offset_index_from_block_index(DataRootOffsetIndex, BI, 0),
+						DiskPoolDataRoots;
+					{_CurrentBI, none} ->
+						throw(last_stored_block_index_has_no_intersection_with_the_new_one);
+					{_CurrentBI, {{H, Offset, _TXRoot}, _Height}} ->
+						PreviousWeaveSize = element(2, hd(CurrentBI)),
+						{ok, OrphanedDataRoots} = remove_orphaned_data(State, Offset,
+							PreviousWeaveSize),
+						ok = data_root_offset_index_from_block_index(
+							DataRootOffsetIndex,
+							lists:takewhile(fun({BH, _, _}) -> BH /= H end, BI),
+							Offset
+						),
+						ar_chunk_storage:cut(Offset),
+						ar_sync_record:cut(Offset, ?MODULE),
+						reset_orphaned_data_roots_disk_pool_timestamps(
+							DiskPoolDataRoots,
+							OrphanedDataRoots
+						)
+				end;
+			false ->
+				DiskPoolDataRoots
 		end,
 	State2 =
 		State#sync_data_state{
@@ -293,6 +309,16 @@ handle_cast({join, Packing_2_5_Threshold, StrictDataSplitThreshold, BI}, State) 
 			packing_2_5_threshold = Packing_2_5_Threshold,
 			strict_data_split_threshold = StrictDataSplitThreshold
 		},
+	ets:insert(ar_data_sync_state, {strict_data_split_threshold, StrictDataSplitThreshold}),
+	{noreply, store_sync_state(State2)};
+
+handle_cast({add_tip_block, Packing_2_5_Threshold, StrictDataSplitThreshold, _, BI}, #sync_data_state{ auto_sync = false } = State) ->
+	State2 = State#sync_data_state{
+		block_index = BI,
+		disk_pool_threshold = get_disk_pool_threshold(BI),
+		packing_2_5_threshold = Packing_2_5_Threshold,
+		strict_data_split_threshold = StrictDataSplitThreshold
+	},
 	ets:insert(ar_data_sync_state, {strict_data_split_threshold, StrictDataSplitThreshold}),
 	{noreply, store_sync_state(State2)};
 
@@ -390,6 +416,9 @@ handle_cast({maybe_drop_data_root_from_disk_pool, {DataRoot, TXSize, TXID}}, Sta
 		disk_pool_size = DiskPoolSize2
 	}};
 
+handle_cast({add_block, _, _}, #sync_data_state{ auto_sync = false } = State) ->
+	{noreply, State};
+
 handle_cast({add_block, B, SizeTaggedTXs}, State) ->
 	add_block(B, SizeTaggedTXs, State),
 	{noreply, State};
@@ -474,6 +503,9 @@ handle_cast({re_include_interval_for_syncing, Left, Right}, State) ->
 
 handle_cast({sync_interval, _, _},
 		#sync_data_state{ sync_disk_space = false } = State) ->
+	{noreply, State};
+handle_cast({sync_interval, _, _},
+		#sync_data_state{ auto_sync = false } = State) ->
 	{noreply, State};
 handle_cast({sync_interval, Left, Right}, State) ->
 	spawn(fun() -> find_subintervals(Left, Right) end),
@@ -811,6 +843,11 @@ handle_cast(store_sync_state, State) ->
 	ar_util:cast_after(?STORE_STATE_FREQUENCY_MS, ?MODULE, store_sync_state),
 	{noreply, State2};
 
+handle_cast(get_sync_state, State) ->
+	State2 = get_sync_state(State),
+	ar_util:cast_after(?GET_STATE_FREQUENCY_MS, ?MODULE, get_sync_state),
+	{noreply, State2};
+
 handle_cast(repack_stored_chunks, #sync_data_state{ packing_disabled = true } = State) ->
 	{noreply, State};
 handle_cast(repack_stored_chunks,
@@ -910,6 +947,8 @@ handle_cast(Cast, State) ->
 
 handle_call({add_chunk, _, _, _, _, _, _}, _, #sync_data_state{ disk_full = true } = State) ->
 	{reply, {error, disk_full}, State};
+handle_call({add_chunk, _, _, _, _, _, _}, _, #sync_data_state{ auto_sync = false } = State) ->
+	{reply, {reason, no_auto_sync}, State};
 handle_call({add_chunk, _, _, _, _, _, _} = Msg, _From, State) ->
 	{add_chunk, DataRoot, DataPath, Chunk, Offset, TXSize, WriteToFreeSpaceBuffer} = Msg,
 	case WriteToFreeSpaceBuffer == write_to_free_space_buffer orelse have_free_space() of
@@ -955,6 +994,8 @@ handle_info({event, chunk, {packed, Offset, ChunkArgs}}, State) ->
 					{_, _, AbsoluteOffset, _, _} = ChunkArgs,
 					{noreply, cache_recently_processed_offset(AbsoluteOffset, ChunkDataKey,
 							State2)};
+				not_found ->
+					{noreply, State2};
 				_Error ->
 					{noreply, State2}
 			end;
@@ -1267,32 +1308,68 @@ init_kv() ->
 		{"disk_pool_chunks_index", BasicOpts ++ BloomFilterOpts},
 		{"migrations_index", BasicOpts}
 	],
+	{ok, Config} = application:get_env(arweave, config),
 	{ok, DB, [_, CF1, CF2, CF3, CF4, CF5, CF6, CF7]} =
-		ar_kv:open("ar_data_sync_db", ColumnFamilyDescriptors),
+		case Config#config.auto_sync of
+			true ->
+				ar_kv:open("ar_data_sync_db", ColumnFamilyDescriptors);
+			false ->
+				ar_kv:open_readonly("ar_data_sync_db", ColumnFamilyDescriptors)
+		end,
 	{ok, ChunkDataDB} =
-		ar_kv:open_without_column_families(
-			"ar_data_sync_chunk_db", [
-				{max_open_files, 1000000},
-				{max_background_compactions, 8},
-				{write_buffer_size, 256 * 1024 * 1024}, % 256 MiB per memtable.
-				{target_file_size_base, 256 * 1024 * 1024}, % 256 MiB per SST file.
-				%% 10 files in L1 to make L1 == L0 as recommended by the
-				%% RocksDB guide https://github.com/facebook/rocksdb/wiki/RocksDB-Tuning-Guide.
-				{max_bytes_for_level_base, 10 * 256 * 1024 * 1024}
-			]
-		),
+		case Config#config.auto_sync of
+			true ->
+				ar_kv:open_without_column_families(
+					"ar_data_sync_chunk_db", [
+						{max_open_files, 1000000},
+						{max_background_compactions, 8},
+						{write_buffer_size, 256 * 1024 * 1024}, % 256 MiB per memtable.
+						{target_file_size_base, 256 * 1024 * 1024}, % 256 MiB per SST file.
+						%% 10 files in L1 to make L1 == L0 as recommended by the
+						%% RocksDB guide https://github.com/facebook/rocksdb/wiki/RocksDB-Tuning-Guide.
+						{max_bytes_for_level_base, 10 * 256 * 1024 * 1024}
+					]
+				);
+			false ->
+				ar_kv:open_readonly_without_column_families(
+					"ar_data_sync_chunk_db", [
+						{max_open_files, 1000000},
+						{max_background_compactions, 8},
+						{write_buffer_size, 256 * 1024 * 1024}, % 256 MiB per memtable.
+						{target_file_size_base, 256 * 1024 * 1024}, % 256 MiB per SST file.
+						%% 10 files in L1 to make L1 == L0 as recommended by the
+						%% RocksDB guide https://github.com/facebook/rocksdb/wiki/RocksDB-Tuning-Guide.
+						{max_bytes_for_level_base, 10 * 256 * 1024 * 1024}
+					]
+				)
+		end,
 	{ok, DiskPoolIndexDB} =
-		ar_kv:open_without_column_families(
-			"ar_data_sync_disk_pool_chunks_index_db", [
-				{max_open_files, 1000000},
-				{max_background_compactions, 8},
-				{write_buffer_size, 256 * 1024 * 1024}, % 256 MiB per memtable.
-				{target_file_size_base, 256 * 1024 * 1024}, % 256 MiB per SST file.
-				%% 10 files in L1 to make L1 == L0 as recommended by the
-				%% RocksDB guide https://github.com/facebook/rocksdb/wiki/RocksDB-Tuning-Guide.
-				{max_bytes_for_level_base, 10 * 256 * 1024 * 1024}
-			] ++ BloomFilterOpts
-		),
+		case Config#config.auto_sync of
+			true ->
+				ar_kv:open_without_column_families(
+					"ar_data_sync_disk_pool_chunks_index_db", [
+						{max_open_files, 1000000},
+						{max_background_compactions, 8},
+						{write_buffer_size, 256 * 1024 * 1024}, % 256 MiB per memtable.
+						{target_file_size_base, 256 * 1024 * 1024}, % 256 MiB per SST file.
+						%% 10 files in L1 to make L1 == L0 as recommended by the
+						%% RocksDB guide https://github.com/facebook/rocksdb/wiki/RocksDB-Tuning-Guide.
+						{max_bytes_for_level_base, 10 * 256 * 1024 * 1024}
+					] ++ BloomFilterOpts
+				);
+			false ->
+				ar_kv:open_readonly_without_column_families(
+					"ar_data_sync_disk_pool_chunks_index_db", [
+						{max_open_files, 1000000},
+						{max_background_compactions, 8},
+						{write_buffer_size, 256 * 1024 * 1024}, % 256 MiB per memtable.
+						{target_file_size_base, 256 * 1024 * 1024}, % 256 MiB per SST file.
+						%% 10 files in L1 to make L1 == L0 as recommended by the
+						%% RocksDB guide https://github.com/facebook/rocksdb/wiki/RocksDB-Tuning-Guide.
+						{max_bytes_for_level_base, 10 * 256 * 1024 * 1024}
+					] ++ BloomFilterOpts
+				)
+		end,
 	State = #sync_data_state{
 		chunks_index = {DB, CF1},
 		data_root_index = {DB, CF2},
@@ -1341,7 +1418,9 @@ record_disk_pool_chunks_count() ->
 	end.
 
 read_data_sync_state() ->
-	case ar_storage:read_term(data_sync_state) of
+	{ok, Config} = application:get_env(arweave, config),
+	SharedDataDir = Config#config.shared_data_dir,
+	case ar_storage:read_term(SharedDataDir, data_sync_state) of
 		{ok, {SyncRecord, RecentBI, DiskPoolDataRoots, DiskPoolSize}} ->
 			ok = ar_sync_record:set(SyncRecord, unpacked, ?MODULE),
 			WeaveSize = case RecentBI of [] -> 0; _ -> element(2, hd(RecentBI)) end,
@@ -1585,8 +1664,11 @@ remove_orphaned_data_root_offsets(State, BlockStartOffset, WeaveSize) ->
 	).
 
 have_free_space() ->
-	ar_storage:get_free_space(?ROCKS_DB_DIR) > ?DISK_DATA_BUFFER_SIZE
-		andalso ar_storage:get_free_space(?CHUNK_DIR) > ?DISK_DATA_BUFFER_SIZE.
+	{ok, Config} = application:get_env(arweave, config),
+	ChunkDirs = Config#config.chunk_dirs,
+	SharedDataDir = Config#config.shared_data_dir,
+	ar_storage:get_free_space2(filename:join(SharedDataDir, ?ROCKS_DB_DIR)) > ?DISK_DATA_BUFFER_SIZE
+		andalso lists:any(fun(Dir) -> ar_storage:get_free_space2(filename:join(Dir, ?CHUNK_DIR)) > ?DISK_DATA_BUFFER_SIZE end, ChunkDirs).
 
 add_block(B, SizeTaggedTXs, State) ->
 	#sync_data_state{
@@ -1719,24 +1801,45 @@ reset_orphaned_data_roots_disk_pool_timestamps(DataRoots, DataRootIndexKeySet) -
 	U.
 
 store_sync_state(State) ->
-	#sync_data_state{
+	case State#sync_data_state.auto_sync of
+		true ->
+			#sync_data_state{
+				disk_pool_data_roots = DiskPoolDataRoots,
+				disk_pool_size = DiskPoolSize,
+				block_index = BI,
+				packing_2_5_threshold = Packing_2_5_Threshold,
+				strict_data_split_threshold = StrictDataSplitThreshold
+			} = State,
+			StoredState = #{ block_index => BI, disk_pool_data_roots => DiskPoolDataRoots,
+				disk_pool_size => DiskPoolSize, packing_2_5_threshold => Packing_2_5_Threshold,
+				strict_data_split_threshold => StrictDataSplitThreshold },
+			{ok, Config} = application:get_env(arweave, config),
+			SharedDataDir = Config#config.shared_data_dir,
+			case ar_storage:write_term(SharedDataDir, data_sync_state, StoredState) of
+				{error, enospc} ->
+					?LOG_WARNING([{event, failed_to_dump_state},
+						{reason, disk_full}]),
+					State#sync_data_state{ disk_full = true };
+				ok ->
+					State#sync_data_state{ disk_full = false }
+			end;
+		false ->
+			State
+	end.
+
+get_sync_state(State) ->
+	{CurrentBI, DiskPoolDataRoots, DiskPoolSize, WeaveSize,
+		Packing_2_5_Threshold, StrictDataSplitThreshold} = read_data_sync_state(),
+	State2 = State#sync_data_state{
+		block_index = CurrentBI,
+		weave_size = WeaveSize,
 		disk_pool_data_roots = DiskPoolDataRoots,
 		disk_pool_size = DiskPoolSize,
-		block_index = BI,
+		disk_pool_threshold = get_disk_pool_threshold(CurrentBI),
 		packing_2_5_threshold = Packing_2_5_Threshold,
 		strict_data_split_threshold = StrictDataSplitThreshold
-	} = State,
-	StoredState = #{ block_index => BI, disk_pool_data_roots => DiskPoolDataRoots,
-			disk_pool_size => DiskPoolSize, packing_2_5_threshold => Packing_2_5_Threshold,
-			strict_data_split_threshold => StrictDataSplitThreshold },
-	case ar_storage:write_term(data_sync_state, StoredState) of
-		{error, enospc} ->
-			?LOG_WARNING([{event, failed_to_dump_state},
-				{reason, disk_full}]),
-			State#sync_data_state{ disk_full = true };
-		ok ->
-			State#sync_data_state{ disk_full = false }
-	end.
+	},
+	State2.
 
 find_random_interval(0) ->
 	[];
@@ -2123,6 +2226,8 @@ write_not_blacklisted_chunk(Offset, ChunkDataKey, ChunkSize, Chunk, DataPath, Pa
 				true ->
 					ar_kv:put(ChunkDataDB, ChunkDataKey, term_to_binary(DataPath))
 			end;
+		not_found ->
+			not_found;
 		_ ->
 			Result
 	end.
@@ -2345,6 +2450,8 @@ store_chunk(ChunkArgs, Args, State) ->
 							log_failed_to_store_chunk(Reason, AbsoluteOffset, DataRoot),
 							{error, Reason}
 					end;
+				not_found ->
+					not_found;
 				{error, Reason} ->
 					log_failed_to_store_chunk(Reason, AbsoluteOffset, DataRoot),
 					{error, Reason}
@@ -2680,6 +2787,8 @@ store_repacked_chunk(ChunkArgs, State) ->
 								ok ->
 									ok
 							end;
+						not_found ->
+							ok;
 						{error, Reason} ->
 							?LOG_ERROR([{event, failed_to_write_repacked_chunk},
 									{reason, io_lib:format("~p", [Reason])}])

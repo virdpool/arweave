@@ -3,26 +3,46 @@
 -include_lib("arweave/include/ar.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
--export([open/1, open/2, open_without_column_families/2,
+-export([open/1, open/2, open_readonly/2, open_without_column_families/2,
 		repair/1, create_column_family/3, close/1, put/3,
 		get/2, get_next_by_prefix/4, get_next/2,
 		cyclic_iterator_move/2, get_prev/2, get_range/2,
 		get_range/3, delete/2, delete_range/3, destroy/1,
-		count/1]).
+		count/1, open_readonly_without_column_families/2]).
 
 open(Name) ->
 	open_without_column_families(Name, []).
 
 open_without_column_families(Name, Opts) ->
-	RocksDBDir = filename:join(ar_meta_db:get(data_dir), ?ROCKS_DB_DIR),
+	RocksDBDir = filename:join(ar_meta_db:get(shared_data_dir), ?ROCKS_DB_DIR),
 	Filename = filename:join(RocksDBDir, Name),
 	ok = filelib:ensure_dir(Filename ++ "/"),
 	LogDir = filename:join([RocksDBDir, "logs", Name]),
 	ok = filelib:ensure_dir(LogDir ++ "/"),
-	rocksdb:open(Filename, [{create_if_missing, true}, {db_log_dir, LogDir}] ++ Opts).
+	case rocksdb:open(Filename, [{create_if_missing, true}, {db_log_dir, LogDir}] ++ Opts) of
+		{ok, DB} ->
+			file:delete(filename:join(Filename, "LOCK")),
+			{ok, DB};
+		Error ->
+			Error
+	end.
+
+open_readonly_without_column_families(Name, Opts) ->
+	RocksDBDir = filename:join(ar_meta_db:get(shared_data_dir), ?ROCKS_DB_DIR),
+	Filename = filename:join(RocksDBDir, Name),
+	ok = filelib:ensure_dir(Filename ++ "/"),
+	LogDir = filename:join([RocksDBDir, "logs", Name]),
+	ok = filelib:ensure_dir(LogDir ++ "/"),
+	case rocksdb:open_readonly(Filename, [{create_if_missing, true}, {db_log_dir, LogDir}] ++ Opts) of
+		{ok, DB} ->
+			file:delete(filename:join(Filename, "LOCK")),
+			{ok, DB};
+		Error ->
+			Error
+	end.
 
 open(Name, CFDescriptors) ->
-	RocksDBDir = filename:join(ar_meta_db:get(data_dir), ?ROCKS_DB_DIR),
+	RocksDBDir = filename:join(ar_meta_db:get(shared_data_dir), ?ROCKS_DB_DIR),
 	LogDir = filename:join([RocksDBDir, "logs", Name]),
 	Filename = filename:join(RocksDBDir, Name),
 	ok = filelib:ensure_dir(Filename ++ "/"),
@@ -34,13 +54,33 @@ open(Name, CFDescriptors) ->
 	],
 	case rocksdb:open(Filename, Opts, CFDescriptors) of
 		{ok, DB, CFs} ->
+			file:delete(filename:join(Filename, "LOCK")),
+			{ok, DB, CFs};
+		Error ->
+			Error
+	end.
+
+open_readonly(Name, CFDescriptors) ->
+	RocksDBDir = filename:join(ar_meta_db:get(shared_data_dir), ?ROCKS_DB_DIR),
+	LogDir = filename:join([RocksDBDir, "logs", Name]),
+	Filename = filename:join(RocksDBDir, Name),
+	ok = filelib:ensure_dir(Filename ++ "/"),
+	ok = filelib:ensure_dir(LogDir ++ "/"),
+	Opts = [
+		{create_if_missing, true},
+		{create_missing_column_families, true},
+		{db_log_dir, LogDir}
+	],
+	case rocksdb:open_readonly(Filename, Opts, CFDescriptors) of
+		{ok, DB, CFs} ->
+			file:delete(filename:join(Filename, "LOCK")),
 			{ok, DB, CFs};
 		Error ->
 			Error
 	end.
 
 repair(Name) ->
-	RocksDBDir = filename:join(ar_meta_db:get(data_dir), ?ROCKS_DB_DIR),
+	RocksDBDir = filename:join(ar_meta_db:get(shared_data_dir), ?ROCKS_DB_DIR),
 	Filename = filename:join(RocksDBDir, Name),
 	ok = filelib:ensure_dir(Filename ++ "/"),
 	rocksdb:repair(Filename, []).
@@ -198,7 +238,7 @@ delete_range(DB, StartKey, EndKey) ->
 	rocksdb:delete_range(DB, StartKey, EndKey, []).
 
 destroy(Name) ->
-	RocksDBDir = filename:join(ar_meta_db:get(data_dir), ?ROCKS_DB_DIR),
+	RocksDBDir = filename:join(ar_meta_db:get(shared_data_dir), ?ROCKS_DB_DIR),
 	Filename = filename:join(RocksDBDir, Name),
 	case filelib:is_dir(Filename) of
 		true ->

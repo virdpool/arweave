@@ -35,3 +35,6 @@
 
 %% The frequency of storing the server state on disk.
 -define(STORE_HEADER_STATE_FREQUENCY_MS, 30000).
+
+%% The frequency of getting the server state from disk.
+-define(GET_HEADER_STATE_FREQUENCY_MS, 2 * 60 * 60 * 1000).

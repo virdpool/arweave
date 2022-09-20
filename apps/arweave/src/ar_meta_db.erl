@@ -98,6 +98,7 @@ init(_) ->
 	%% Initialise the metadata storage service.
 	{ok, Config} = application:get_env(arweave, config),
 	ets:insert(?MODULE, {data_dir, Config#config.data_dir}),
+	ets:insert(?MODULE, {shared_data_dir, Config#config.shared_data_dir}),
 	ets:insert(?MODULE, {metrics_dir, Config#config.metrics_dir}),
 	ets:insert(?MODULE, {port, Config#config.port}),
 	ets:insert(?MODULE, {mine, Config#config.mine}),

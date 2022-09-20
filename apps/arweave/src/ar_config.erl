@@ -72,6 +72,28 @@ parse_options([{<<"data_dir">>, DataDir} | Rest], Config) when is_binary(DataDir
 parse_options([{<<"data_dir">>, DataDir} | _], _) ->
 	{error, {bad_type, data_dir, string}, DataDir};
 
+parse_options([{<<"shared_data_dir">>, SharedDataDir} | Rest], Config) when is_binary(SharedDataDir) ->
+	parse_options(Rest, Config#config{ shared_data_dir = binary_to_list(SharedDataDir) });
+parse_options([{<<"shared_data_dir">>, SharedDataDir} | _], _) ->
+	{error, {bad_type, shared_data_dir, string}, SharedDataDir};
+
+parse_options([{<<"chunk_dirs">>, ChunkDirs} | Rest], Config) when is_list(ChunkDirs) ->
+	case safe_map(fun(Dir) -> binary_to_list(Dir) end, ChunkDirs) of
+		{ok, ChunkDirLists} ->
+			parse_options(Rest, Config#config{ chunk_dirs = ChunkDirLists });
+		error ->
+			{error, bad_chunk_dirs}
+	end;
+parse_options([{<<"chunk_dir">>, ChunkDirs} | _], _) ->
+	{error, {bad_type, chunk_dirs, array}, ChunkDirs};
+
+parse_options([{<<"no_auto_sync">>, true} | Rest], Config) ->
+	parse_options(Rest, Config#config{ auto_sync = false });
+parse_options([{<<"no_auto_sync">>, false} | Rest], Config) ->
+	parse_options(Rest, Config);
+parse_options([{<<"no_auto_sync">>, Opt} | _], _) ->
+	{error, {bad_type, no_auto_sync, boolean}, Opt};
+
 parse_options([{<<"metrics_dir">>, MetricsDir} | Rest], Config) when is_binary(MetricsDir) ->
 	parse_options(Rest, Config#config { metrics_dir = binary_to_list(MetricsDir) });
 parse_options([{<<"metrics_dir">>, MetricsDir} | _], _) ->

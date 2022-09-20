@@ -67,6 +67,9 @@
 %% The frequency of storing the server state on disk.
 -define(STORE_STATE_FREQUENCY_MS, 30000).
 
+%% The frequency of getting the server state from disk.
+-define(GET_STATE_FREQUENCY_MS, 2 * 60 * 60 * 1000).
+
 %% The maximum number of chunks to scheduler for packing/unpacking.
 %% A bigger number means more memory allocated for the chunks not packed/unpacked yet.
 -define(PACKING_BUFFER_SIZE, 1000).
@@ -198,6 +201,8 @@
 	disk_full = false,
 	%% A flag indicating whether there is sufficient disk space for syncing more data.
 	sync_disk_space = true,
+  %% A flag indicating whether automatically sync data. if false, we avoid syncing data.
+	auto_sync = true,
 	%% The offsets of the chunks currently scheduled for (re-)packing (keys) and
 	%% some chunk metadata needed for storing the chunk once it is packed.
 	packing_map = #{},

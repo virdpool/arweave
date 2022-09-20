@@ -108,6 +108,11 @@ show_help() ->
 						"This port must be accessible by remote peers."},
 			{"data_dir",
 				"The directory for storing the weave and the wallets (when generated)."},
+			{"shared_data_dir",
+				"The directory for storing shared data (rocksdb, data_sync_state, chunk_storage_index, header_sync_state)."},
+			{"chunk_dir",
+				"The directory (or set of directories) for storing the weave."},
+			{"no_auto_sync", "Do not automatically sync the weave."},
 			{"metrics_dir", "The directory for persisted metrics."},
 			{"polling (num)", lists:flatten(
 					io_lib:format(
@@ -299,6 +304,12 @@ parse_cli_args(["port", Port|Rest], C) ->
 	parse_cli_args(Rest, C#config { port = list_to_integer(Port) });
 parse_cli_args(["data_dir", DataDir|Rest], C) ->
 	parse_cli_args(Rest, C#config { data_dir = DataDir });
+parse_cli_args(["shared_data_dir", SharedDataDir|Rest], C) ->
+	parse_cli_args(Rest, C#config { shared_data_dir = SharedDataDir });
+parse_cli_args(["chunk_dir", ChunkDir|Rest], C = #config { chunk_dirs = Dirs }) ->
+	parse_cli_args(Rest, C#config { chunk_dirs = [ ChunkDir | Dirs] });
+parse_cli_args(["no_auto_sync"|Rest], C) ->
+	parse_cli_args(Rest, C#config { auto_sync = false });
 parse_cli_args(["metrics_dir", MetricsDir|Rest], C) ->
 	parse_cli_args(Rest, C#config { metrics_dir = MetricsDir });
 parse_cli_args(["polling", Frequency|Rest], C) ->

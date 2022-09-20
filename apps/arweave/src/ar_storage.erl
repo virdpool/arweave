@@ -7,7 +7,7 @@
 		update_confirmation_index/1, get_tx_confirmation_data/1, get_wallet_list_range/2,
 		read_wallet_list/1, write_wallet_list/4, write_wallet_list/2, write_wallet_list_chunk/3,
 		write_block_index/1, read_block_index/0, delete_blacklisted_tx/1,
-		get_free_space/1, lookup_tx_filename/1, wallet_list_filepath/1,
+		get_free_space/1, get_free_space2/1, get_disk_data/1, lookup_tx_filename/1, wallet_list_filepath/1,
 		tx_filepath/1, tx_data_filepath/1, read_tx_file/1, read_migrated_v1_tx_file/1,
 		ensure_directories/1, write_file_atomic/2, write_term/2, write_term/3, read_term/1,
 		read_term/2, delete_term/1]).
@@ -146,6 +146,21 @@ get_free_space(Dir) ->
 		Limit ->
 			max(0, Limit - (KByteSize - CapacityKByteSize) * 1024)
 	end.
+
+%% @doc Return available disk space, in bytes, parse in absolute dir.
+get_free_space2(Dir) ->
+	{ok, Config} = application:get_env(arweave, config),
+	{_, KByteSize, CapacityKByteSize} = get_disk_data(Dir),
+	case Config#config.disk_space of
+		undefined ->
+			CapacityKByteSize * 1024;
+		Limit ->
+			max(0, Limit - (KByteSize - CapacityKByteSize) * 1024)
+	end.
+
+get_disk_data(Dir) ->
+	[DiskData | _] = select_drive(ar_disksup:get_disk_data(), filename:absname(Dir)),
+	DiskData.
 
 lookup_block_filename(H) ->
 	{ok, Config} = application:get_env(arweave, config),
@@ -370,7 +385,7 @@ write_tx_data(ExpectedDataRoot, DataTree, Data, SizeTaggedChunks, WriteToFreeSpa
 					data_path => DataPath,
 					data_size => byte_size(Data)
 				},
-				case ar_data_sync:add_chunk(Proof, 30000, WriteToFreeSpaceBuffer) of
+				case ar_data_sync:add_chunk(Proof, 50000, WriteToFreeSpaceBuffer) of
 					ok ->
 						Acc;
 					{error, Reason} ->
@@ -527,15 +542,21 @@ read_tx_data(TX) ->
 
 %% Write a block index to disk for retreival later (in emergencies).
 write_block_index(BI) ->
-	?LOG_INFO([{event, writing_block_index_to_disk}]),
-	JSON = ar_serialize:jsonify(ar_serialize:block_index_to_json_struct(BI)),
-	File = block_index_filepath(),
-	case write_file_atomic(File, JSON) of
-		ok ->
-			ok;
-		{error, Reason} = Error ->
-			?LOG_ERROR([{event, failed_to_write_block_index_to_disk}, {reason, Reason}]),
-			Error
+	{ok, Config} = application:get_env(arweave, config),
+	case Config#config.auto_sync of
+		true ->
+			?LOG_INFO([{event, writing_block_index_to_disk}]),
+			JSON = ar_serialize:jsonify(ar_serialize:block_index_to_json_struct(BI)),
+			File = block_index_filepath(),
+			case write_file_atomic(File, JSON) of
+				ok ->
+					ok;
+				{error, Reason} = Error ->
+					?LOG_ERROR([{event, failed_to_write_block_index_to_disk}, {reason, Reason}]),
+					Error
+			end;
+	false ->
+		?LOG_INFO([{event, stop_writing_block_index_to_disk}])
 	end.
 
 write_wallet_list(RootHash, Tree) ->
@@ -715,9 +736,25 @@ init([]) ->
 	process_flag(trap_exit, true),
 	{ok, Config} = application:get_env(arweave, config),
 	ensure_directories(Config#config.data_dir),
-	{ok, DB} = ar_kv:open_without_column_families("ar_storage_tx_confirmation_db", []),
-	{ok, TXDB} = ar_kv:open_without_column_families("ar_storage_tx_db", []),
-	{ok, BlockDB} = ar_kv:open_without_column_families("ar_storage_block_db", []),
+	{ok, DB} = case Config#config.auto_sync of
+							 true ->
+								 ar_kv:open_without_column_families("ar_storage_tx_confirmation_db", []);
+							 false ->
+								 ar_kv:open_readonly_without_column_families("ar_storage_tx_confirmation_db", [])
+						 end,
+
+	{ok, TXDB} = case Config#config.auto_sync of
+								 true ->
+									 ar_kv:open_without_column_families("ar_storage_tx_db", []);
+								 false ->
+									 ar_kv:open_readonly_without_column_families("ar_storage_tx_db", [])
+							 end,
+	{ok, BlockDB} = case Config#config.auto_sync of
+										true ->
+											ar_kv:open_without_column_families("ar_storage_block_db", []);
+										false ->
+											ar_kv:open_readonly_without_column_families("ar_storage_block_db", [])
+									end,
 	ets:insert(?MODULE, [{tx_confirmation_db, DB}, {tx_db, TXDB}, {block_db, BlockDB}]),
 	{ok, #state{ tx_confirmation_db = DB, tx_db = TXDB, block_db = BlockDB }}.
 
@@ -819,10 +856,6 @@ parse_block_json(JSON) ->
 					{error, io_lib:format("~p", [Error])}]),
 			unavailable
 	end.
-
-get_disk_data(Dir) ->
-	[DiskData | _] = select_drive(ar_disksup:get_disk_data(), filename:absname(Dir)),
-	DiskData.
 
 select_drive(Disks, []) ->
 	CWD = "/",
