@@ -5,7 +5,7 @@
 
 %% The mainnet name. Does not change at the hard forks.
 -ifndef(NETWORK_NAME).
--define(NETWORK_NAME, "arweave.N.1").
+-define(NETWORK_NAME, "arweave.2.6.testnet").
 -endif.
 
 %% The current release number of the arweave client software.
