@@ -115,16 +115,15 @@ handle_cast({join, Height, RecentBI, Blocks}, State) ->
 				State2;
 			{_, {PrevHeight, _}} ->
 				State2;
-			{_, no_intersection} when Reset	->
-				IntersectionHeight = Height,
+			{_, no_intersection} when Reset, Height < StartHeight ->
 				S = State2#state{
-						sync_record = ar_intervals:cut(SyncRecord, IntersectionHeight),
-						retry_record = ar_intervals:cut(RetryRecord, IntersectionHeight) },
+						sync_record = ar_intervals:cut(SyncRecord, Height),
+						retry_record = ar_intervals:cut(RetryRecord, Height) },
 				ok = store_sync_state(S),
 				%% Delete from the kv store only after the sync record is saved - no matter
 				%% what happens to the process, if a height is in the record, it must be present
 				%% in the kv store.
-				ok = ar_kv:delete_range(DB, << (IntersectionHeight + 1):256 >>,
+				ok = ar_kv:delete_range(DB, << (Height + 1):256 >>,
 						<< (PrevHeight + 1):256 >>),
 				S;
 			{_, no_intersection} ->
