@@ -1177,8 +1177,9 @@ get_chunk(Offset, Pack, Packing, StoredPacking, ChunksIndex, ChunkDataDB,
 			{ok, {Chunk, DataPath}, ChunkOffset, TXRoot, ChunkSize, TXPath} ->
 				case validate_served_chunk({ChunkOffset, DataPath, TXPath, TXRoot, ChunkSize,
 						ChunksIndex, StoreID}) of
-					true ->
-						{ok, {Chunk, DataPath}, ChunkOffset, TXRoot, ChunkSize, TXPath};
+					{true, ChunkID} ->
+						{ok, {Chunk, DataPath}, ChunkOffset, TXRoot, ChunkSize, TXPath,
+								ChunkID};
 					false ->
 						{error, chunk_not_found}
 				end
@@ -1186,25 +1187,44 @@ get_chunk(Offset, Pack, Packing, StoredPacking, ChunksIndex, ChunkDataDB,
 	case ValidateChunk of
 		{error, Reason4} ->
 			{error, Reason4};
-		{ok, {Chunk2, DataPath2}, ChunkOffset2, TXRoot2, ChunkSize2, TXPath2} ->
+		{ok, {Chunk2, DataPath2}, ChunkOffset2, TXRoot2, ChunkSize2, TXPath2, ChunkID2} ->
 			PackResult =
 				case {Pack, Packing == StoredPacking} of
 					{false, true} ->
-						{ok, Chunk2};
+						U = case StoredPacking of unpacked -> Chunk2; _ -> none end,
+						{ok, {Chunk2, U, ChunkID2}};
 					{false, false} ->
 						{error, chunk_not_found};
 					{true, true} ->
-						{ok, Chunk2};
+						U = case StoredPacking of unpacked -> Chunk2; _ -> none end,
+						{ok, {Chunk2, U, ChunkID2}};
 					{true, false} ->
 						{ok, Unpacked} = ar_packing_server:unpack(StoredPacking, ChunkOffset2,
 								TXRoot2, Chunk2, ChunkSize2),
-						ar_packing_server:pack(Packing, ChunkOffset2, TXRoot2, Unpacked)
+						{ok, Packed} = ar_packing_server:pack(Packing, ChunkOffset2, TXRoot2,
+								Unpacked),
+						{ok, {Packed, Unpacked, ChunkID2}}
 				end,
 			case PackResult of
-				{ok, PackedChunk} ->
+				{ok, {PackedChunk, none, _ChunkID3}} ->
 					Proof = #{ tx_root => TXRoot2, chunk => PackedChunk,
 							data_path => DataPath2, tx_path => TXPath2 },
 					{ok, Proof};
+				{ok, {PackedChunk, _MaybeUnpackedChunk, none}} ->
+					Proof = #{ tx_root => TXRoot2, chunk => PackedChunk,
+							data_path => DataPath2, tx_path => TXPath2 },
+					{ok, Proof};
+				{ok, {PackedChunk, MaybeUnpackedChunk, ChunkID3}} ->
+					case ar_tx:generate_chunk_id(MaybeUnpackedChunk) == ChunkID3 of
+						true ->
+							Proof = #{ tx_root => TXRoot2, chunk => PackedChunk,
+									data_path => DataPath2, tx_path => TXPath2 },
+							{ok, Proof};
+						false ->
+							invalidate_bad_data_record(ChunkOffset2 - ChunkSize2, ChunkOffset2,
+									ChunksIndex, StoreID, 3),
+							{error, chunk_not_found}
+					end;
 				Error ->
 					Error
 			end
@@ -1229,7 +1249,7 @@ validate_served_chunk(Args) ->
 	[{_, T}] = ets:lookup(ar_data_sync_state, disk_pool_threshold),
 	case Offset > T orelse not ar_node:is_joined() of
 		true ->
-			true;
+			{true, none};
 		false ->
 			case ar_block_index:get_block_bounds(Offset - 1) of
 				{BlockStart, BlockEnd, TXRoot} ->
@@ -1244,8 +1264,8 @@ validate_served_chunk(Args) ->
 					ChunkOffset = Offset - BlockStart - 1,
 					case validate_proof2({TXRoot, ChunkOffset, BlockSize, DataPath, TXPath,
 							ChunkSize, ValidateDataPathFun}) of
-						true ->
-							true;
+						{true, ChunkID} ->
+							{true, ChunkID};
 						false ->
 							StartOffset = Offset - ChunkSize,
 							invalidate_bad_data_record(StartOffset, Offset, ChunksIndex,
@@ -2101,10 +2121,15 @@ validate_proof2(Args) ->
 			TXSize = TXEndOffset - TXStartOffset,
 			ChunkOffset = Offset - TXStartOffset,
 			case ValidateDataPathFun(DataRoot, ChunkOffset, TXSize, DataPath) of
-				false ->
-					false;
-				{_ChunkID, ChunkStartOffset, ChunkEndOffset} ->
-					ChunkEndOffset - ChunkStartOffset == ChunkSize
+				{ChunkID, ChunkStartOffset, ChunkEndOffset} ->
+					case ChunkEndOffset - ChunkStartOffset == ChunkSize of
+						false ->
+							false;
+						true ->
+							{true, ChunkID}
+					end;
+				_ ->
+					false
 			end
 	end.
 
