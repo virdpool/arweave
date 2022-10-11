@@ -346,7 +346,15 @@ handle_cast({join, RecentBI, Packing_2_5_Threshold, Packing_2_6_Threshold}, Stat
 			ar_events:send(data_sync, {cut, Offset}),
 			reset_orphaned_data_roots_disk_pool_timestamps(OrphanedDataRoots);
 		{_, no_intersection} ->
-			throw(last_stored_block_index_has_no_intersection_with_the_new_one);
+			Height = ar_node:get_height(),
+			Dump = term_to_binary({Height, CurrentBI, ar_block_index:get_list(Height)}),
+			ID = ar_util:encode(crypto:strong_rand_bytes(8)),
+			ok = file:write_file("ar_data_sync_state_dump_" ++ binary_to_list(ID), Dump),
+			?LOG_ERROR([{event,
+					last_stored_block_index_has_no_intersection_with_the_new_one},
+					{state_dump, "ar_data_sync_state_dump_" ++ binary_to_list(ID)}]),
+			timer:sleep(1000),
+			erlang:halt();
 		{_, {_H, Offset, _TXRoot}} ->
 			PreviousWeaveSize = element(2, hd(CurrentBI)),
 			{ok, OrphanedDataRoots} = remove_orphaned_data(State, Offset, PreviousWeaveSize),

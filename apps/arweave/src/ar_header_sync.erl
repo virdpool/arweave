@@ -127,7 +127,15 @@ handle_cast({join, Height, RecentBI, Blocks}, State) ->
 						<< (PrevHeight + 1):256 >>),
 				S;
 			{_, no_intersection} ->
-				throw(last_stored_block_index_has_no_intersection_with_the_new_one);
+				Dump = term_to_binary({StartHeight, Height, CurrentBI,
+						ar_block_index:get_list(Height)}),
+				ID = ar_util:encode(crypto:strong_rand_bytes(8)),
+				ok = file:write_file("ar_header_sync_state_dump_" ++ binary_to_list(ID), Dump),
+				?LOG_ERROR([{event,
+						last_stored_block_index_has_no_intersection_with_the_new_one},
+						{state_dump, "ar_header_sync_state_dump_" ++ binary_to_list(ID)}]),
+				timer:sleep(1000),
+				erlang:halt();
 			{_, {IntersectionHeight, _}} ->
 				S = State2#state{
 						sync_record = ar_intervals:cut(SyncRecord, IntersectionHeight),

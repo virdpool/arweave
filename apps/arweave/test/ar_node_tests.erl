@@ -437,7 +437,7 @@
 %			Slave).
 
 ar_node_interface_test_() ->
-	{timeout, 30, fun test_ar_node_interface/0}.
+	{timeout, 60, fun test_ar_node_interface/0}.
 
 test_ar_node_interface() ->
 	[B0] = ar_weave:init(),
