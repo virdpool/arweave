@@ -404,6 +404,31 @@ parse_post_repacking_2_6_fields(B, << SigSize:16, Sig:SigSize/binary, RecallByte
 		PreviousSolutionHash:PreviousSolutionHashSize/binary,
 		PartitionNumber:256, NonceLimiterOutput:32/binary,
 		GlobalStepNumber:64, Seed:48/binary, NextSeed:48/binary,
+		PartitionUpperBound:256, NextPartitionUpperBound:256,
+		LastCheckpointsLen:16, LastCheckpoints:(LastCheckpointsLen * 32)/binary,
+		CheckpointsLen:16, Checkpoints:(CheckpointsLen * 32)/binary,
+		ChunkSize:24, Chunk:ChunkSize/binary, RewardKeySize:16,
+		RewardKey:RewardKeySize/binary, TXPathSize:24, TXPath:TXPathSize/binary,
+		DataPathSize:24, DataPath:DataPathSize/binary >>) ->
+	%% For compatibility with the blocks from the currently running testnet (to quickly
+	%% restart it without forking it off from the mainnet again).
+	parse_post_repacking_2_6_fields(B, << SigSize:16, Sig:SigSize/binary, RecallByte2Size:16,
+		RecallByte2:(RecallByte2Size * 8), PreviousSolutionHashSize:8,
+		PreviousSolutionHash:PreviousSolutionHashSize/binary,
+		PartitionNumber:256, NonceLimiterOutput:32/binary,
+		GlobalStepNumber:64, Seed:48/binary, NextSeed:48/binary,
+		0:8, % Empty PrevOutput.
+		PartitionUpperBound:256, NextPartitionUpperBound:256,
+		LastCheckpointsLen:16, LastCheckpoints:(LastCheckpointsLen * 32)/binary,
+		CheckpointsLen:16, Checkpoints:(CheckpointsLen * 32)/binary,
+		ChunkSize:24, Chunk:ChunkSize/binary, RewardKeySize:16,
+		RewardKey:RewardKeySize/binary, TXPathSize:24, TXPath:TXPathSize/binary,
+		DataPathSize:24, DataPath:DataPathSize/binary >>);
+parse_post_repacking_2_6_fields(B, << SigSize:16, Sig:SigSize/binary, RecallByte2Size:16,
+		RecallByte2:(RecallByte2Size * 8), PreviousSolutionHashSize:8,
+		PreviousSolutionHash:PreviousSolutionHashSize/binary,
+		PartitionNumber:256, NonceLimiterOutput:32/binary,
+		GlobalStepNumber:64, Seed:48/binary, NextSeed:48/binary,
 		PrevOutputSize:8, PrevOutput:PrevOutputSize/binary,
 		PartitionUpperBound:256, NextPartitionUpperBound:256,
 		LastCheckpointsLen:16, LastCheckpoints:(LastCheckpointsLen * 32)/binary,
