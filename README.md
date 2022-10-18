@@ -44,6 +44,59 @@ Clone the repo and initialize the Git submodules:
 $ git clone --recursive https://github.com/ArweaveTeam/arweave.git
 ```
 
+## Building on Windows
+
+Still experimental (currently works only with 2.5 master)
+
+### Requirements
+
+- otp_win64_24.3.4.6.exe (https://www.erlang.org/downloads OTP 25 will not work)
+- Git-2.38.0-64-bit.exe (https://git-scm.com/download/win)
+- vs_BuildTools.exe VS 2019 (https://aka.ms/vs/16/release/vs_buildtools.exe)
+- Open Visual Studio installer, select
+  - Visual C++ Build Tools (main screen)
+  - In second tab (ensure selected):
+    - Universal CRT
+    - SDK for Windows 10
+    - Cmake
+
+### Patch system PATH variable
+
+Ensure you have
+- c:\Program Files\erl-24.3.4.6\bin\
+- c:\Program Files\Git\cmd
+- c:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\
+- c:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\VC\Tools\MSVC\14.29.30133\bin\Hostx64\x64\
+
+String for copypaste
+```bat
+c:\Program Files\erl-24.3.4.6\bin\;c:\Program Files\Git\cmd;c:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\;c:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\VC\Tools\MSVC\14.29.30133\bin\Hostx64\x64\
+```
+
+Ensure you DON'T have any other cmake in path. E.g. c:\Program Files\CMake
+  
+```bat
+git clone --recursive https://github.com/ArweaveTeam/arweave.git arweave
+git clone --recursive https://github.com/erlang/rebar3 rebar3
+cd rebar3
+bootstrap.bat
+cd arweave
+..\rebar3\rebar3 tar as prod
+```
+
+### Bug reports for windows build
+
+Before posting any bug report please relaunch build from scratch with
+```bat
+set DIAGNOSTIC=1
+```
+
+Build log is important so redirrect it to file
+```bat
+..\rebar3\rebar3 tar as prod > log
+```
+
+
 ## Running a node locally
 
 ```sh
