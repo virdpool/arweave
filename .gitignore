@@ -5,9 +5,11 @@
 testlog
 apps/arweave/priv/tls
 apps/arweave/priv/*.so
+apps/arweave/priv/*.lib
 _build
 .rebar3
 apps/arweave/c_src/*.o
+apps/arweave/c_src/build
 data_test_master
 data_test_slave
 erl_crash.dump

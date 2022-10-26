@@ -26,7 +26,9 @@ struct state {
 	randomx_cache*    cachePtr;
 };
 
-const int ARWEAVE_INPUT_DATA_SIZE = 48;
+// doesn't compile with MSVC
+// const int ARWEAVE_INPUT_DATA_SIZE = 48;
+#define ARWEAVE_INPUT_DATA_SIZE  48
 const int ARWEAVE_HASH_SIZE = 48;
 const int SPORA_SUBSPACES_COUNT = 1024;
 const int SPORA_SEARCH_SPACE_SHARE = 10;

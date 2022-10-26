@@ -77,12 +77,70 @@ Ensure you DON'T have any other cmake in path. E.g. c:\Program Files\CMake
   
 ```bat
 git clone --recursive https://github.com/ArweaveTeam/arweave.git arweave
+
 git clone --recursive https://github.com/erlang/rebar3 rebar3
 cd rebar3
 bootstrap.bat
+cd ..
+
+git clone https://github.com/microsoft/vcpkg
+cd vcpkg
+bootstrap-vcpkg.bat
+# WIN7 ONLY
+# go download
+# https://github.com/nalexandru/api-ms-win-core-path-HACK/releases
+# https://github.com/nalexandru/api-ms-win-core-path-HACK/releases/download/0.3.1/api-ms-win-core-path-blender-0.3.1.zip
+# unpack
+# copy as api-ms-win-core-path-HACK recommends (admin required)
+# copy x64\api-ms-win-core-path-l1-1-0.dll C:\Windows\System32
+# copy x86\api-ms-win-core-path-l1-1-0.dll C:\Windows\SysWOW64
+# WIN7 ONLY (as admin)
+vcpkg install python3[deprecated-win7-support]
+
+vcpkg install gmp:x64-windows
+vcpkg install openssl:x64-windows
+cd ..
+
 cd arweave
+
+# if needed go arweave/apps/arweave/c_src/CMakeLists.txt
+# patch this line with your path to erlang includes
+# include_directories("c:/Program Files/erl-24.3.4.6/usr/include")
+# Also you need patch vcpkg dir if your installation folder is somewhere else then recommended path before
+# include_directories("../../../../vcpkg/buildtrees/gmp/x64-windows-rel")
+# include_directories("../../../../vcpkg/buildtrees/openssl/x64-windows-rel/include")
+
 ..\rebar3\rebar3 tar as prod
 ```
+
+After build go _build/default/rel/arweave/releases/2.?.?.0
+# create vm.args
+```
+-name arweave@127.0.0.1
+-setcookie arweave
+```
+https://github.com/erlware/relx/issues/543
+
+foreground doesn't work so use console instead
+https://github.com/erlware/relx/issues/691
+bin/start will also not work. Use
+
+```
+set ERL_EPMD_ADDRESS=127.0.0.1
+set NODE_NAME="arweave@127.0.0.1"
+_build\default\rel\arweave\bin\arweave.cmd console
+```
+for better experience patch arweave.cmd
+```
+# remove this
+start "%rel_name% console" %werl% %boot% %sys_config%  ^
+       -args_file "%vm_args%"
+# add this
+%erl% %boot% %sys_config%  ^
+       -args_file "%vm_args%"
+
+```
+
 
 ### Bug reports for windows build
 
