@@ -838,6 +838,16 @@ get_disk_data(Dir) ->
 	[DiskData | _] = select_drive(ar_disksup:get_disk_data(), filename:absname(Dir)),
 	DiskData.
 
+% fix for win32 (case insensitive path)
+normalize_disk_path(Name)->
+	{OsType, _skip} = os:type(),
+	case OsType of
+		win32 ->
+			string:lowercase(Name);
+		_ ->
+			Name
+	end.
+
 select_drive(Disks, []) ->
 	CWD = "/",
 	case
@@ -861,7 +871,7 @@ select_drive(Disks, CWD) ->
 			Drives = lists:filter(
 				fun({Name, _, _}) ->
 					try
-						case string:find(Name, CWD) of
+						case string:find(normalize_disk_path(Name), normalize_disk_path(CWD)) of
 							nomatch -> false;
 							_ -> true
 						end

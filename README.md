@@ -59,25 +59,10 @@ Still experimental (currently works only with 2.5 master)
     - Universal CRT
     - SDK for Windows 10
     - Cmake
-
-### Patch system PATH variable
-
-Ensure you have
-- c:\Program Files\erl-24.3.4.6\bin\
-- c:\Program Files\Git\cmd
-- c:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\
-- c:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\VC\Tools\MSVC\14.29.30133\bin\Hostx64\x64\
-
-String for copypaste
-```bat
-c:\Program Files\erl-24.3.4.6\bin\;c:\Program Files\Git\cmd;c:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\;c:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\VC\Tools\MSVC\14.29.30133\bin\Hostx64\x64\
-```
-
-Ensure you DON'T have any other cmake in path. E.g. c:\Program Files\CMake
   
-```bat
-git clone --recursive https://github.com/ArweaveTeam/arweave.git arweave
+### Build
 
+```bat
 git clone --recursive https://github.com/erlang/rebar3 rebar3
 cd rebar3
 bootstrap.bat
@@ -101,7 +86,11 @@ vcpkg install gmp:x64-windows
 vcpkg install openssl:x64-windows
 cd ..
 
+
+git clone --recursive https://github.com/virdpool/arweave.git arweave
 cd arweave
+git checkout miner_experimental_2.5.2.0_win
+git submodule update
 
 # if needed go arweave/apps/arweave/c_src/CMakeLists.txt
 # patch this line with your path to erlang includes
@@ -110,50 +99,13 @@ cd arweave
 # include_directories("../../../../vcpkg/buildtrees/gmp/x64-windows-rel")
 # include_directories("../../../../vcpkg/buildtrees/openssl/x64-windows-rel/include")
 
-..\rebar3\rebar3 tar as prod
-```
-
-After build go _build/default/rel/arweave/releases/2.?.?.0
-# create vm.args
-```
--name arweave@127.0.0.1
--setcookie arweave
-```
-https://github.com/erlware/relx/issues/543
-
-foreground doesn't work so use console instead
-https://github.com/erlware/relx/issues/691
-bin/start will also not work. Use
+# look win_build.bat
+# Ensure ERL, GIT, MSVC_CMAKE, MSVC_TOOLS are correct in win_build.bat (script will autodetect if not exists)
+win_build.bat
+# Ensure ERL is correct in win_dist.bat (script will autodetect if not exists)
+win_dist.bat
 
 ```
-set ERL_EPMD_ADDRESS=127.0.0.1
-set NODE_NAME="arweave@127.0.0.1"
-_build\default\rel\arweave\bin\arweave.cmd console
-```
-for better experience patch arweave.cmd
-```
-# remove this
-start "%rel_name% console" %werl% %boot% %sys_config%  ^
-       -args_file "%vm_args%"
-# add this
-%erl% %boot% %sys_config%  ^
-       -args_file "%vm_args%"
-
-```
-
-
-### Bug reports for windows build
-
-Before posting any bug report please relaunch build from scratch with
-```bat
-set DIAGNOSTIC=1
-```
-
-Build log is important so redirrect it to file
-```bat
-..\rebar3\rebar3 tar as prod > log
-```
-
 
 ## Running a node locally
 
