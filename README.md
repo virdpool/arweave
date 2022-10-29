@@ -65,6 +65,7 @@ Still experimental (currently works only with 2.5 master)
 ```bat
 git clone --recursive https://github.com/erlang/rebar3 rebar3
 cd rebar3
+set PATH=%PATH%;c:\Program Files\erl-24.3.4.6\bin
 bootstrap.bat
 cd ..
 
