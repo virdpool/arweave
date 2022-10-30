@@ -80,7 +80,12 @@ bootstrap-vcpkg.bat
 # copy as api-ms-win-core-path-HACK recommends (admin required)
 # copy x64\api-ms-win-core-path-l1-1-0.dll C:\Windows\System32
 # copy x86\api-ms-win-core-path-l1-1-0.dll C:\Windows\SysWOW64
-# WIN7 ONLY (as admin)
+# WIN7 ONLY
+vcpkg install zlib:x64-windows
+vcpkg install zlib:x86-windows
+# (as admin)
+copy installed\x64-windows\bin\zlib1.dll C:\Windows\System32
+copy installed\x86-windows\bin\zlib1.dll C:\Windows\SysWOW64
 vcpkg install python3[deprecated-win7-support]
 
 vcpkg install gmp:x64-windows
