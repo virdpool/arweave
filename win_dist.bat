@@ -23,7 +23,7 @@ copy scripts\start.bat win_dist\arweave
 copy scripts\stop.bat win_dist\arweave
 
 mkdir win_dist\arweave\apps\ar_sqlite3\priv
-copy arweave\apps\ar_sqlite3\priv\ar_sqlite3_driver.exe win_dist\arweave\apps\ar_sqlite3\priv\ar_sqlite3_driver.exe
+copy apps\ar_sqlite3\priv\ar_sqlite3_driver.exe win_dist\arweave\apps\ar_sqlite3\priv\ar_sqlite3_driver.exe
 
 copy ..\vcpkg\buildtrees\gmp\x64-windows-rel\.libs\gmp-10.dll win_dist\arweave
 copy ..\vcpkg\buildtrees\openssl\x64-windows-rel\libcrypto-3-x64.dll win_dist\arweave
