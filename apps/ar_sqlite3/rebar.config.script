@@ -1,0 +1,10 @@
+{OsType, _skip} = os:type(),
+Artifact = case OsType of
+    win32 ->
+        {artifacts, ["priv/ar_sqlite3_driver.exe"]};
+    _ ->
+        {artifacts, ["priv/ar_sqlite3_driver"]}
+end,
+CONFIG ++ [
+    Artifact
+].
