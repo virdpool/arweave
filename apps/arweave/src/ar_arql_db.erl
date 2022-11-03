@@ -11,12 +11,12 @@
 -include_lib("arweave/include/ar_config.hrl").
 
 %% Timeout passed to gen_server:call when running SELECTs.
-%% Set to 5s.
--define(SELECT_TIMEOUT, 5000).
+%% Set to 10s.
+-define(SELECT_TIMEOUT, 10000).
 
 %% Time to wait for the NIF thread to send back the query results.
-%% Set to 4.5s.
--define(DRIVER_TIMEOUT, 4500).
+%% Set to 9s.
+-define(DRIVER_TIMEOUT, 9000).
 
 %% Time to wait until an operation (bind, step, etc) required for inserting an entity is complete.
 -define(INSERT_STEP_TIMEOUT, 60000).

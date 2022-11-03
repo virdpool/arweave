@@ -82,6 +82,81 @@ Clone the repo and initialize the Git submodules:
 $ git clone --recursive https://github.com/ArweaveTeam/arweave.git
 ```
 
+## Building on Windows
+
+Still experimental (currently works only with 2.5 master)
+
+### Requirements
+
+- otp_win64_24.3.4.6.exe (https://www.erlang.org/downloads OTP 25 will not work)
+- Git-2.38.0-64-bit.exe (https://git-scm.com/download/win)
+- vs_BuildTools.exe VS 2019 (https://aka.ms/vs/16/release/vs_buildtools.exe)
+- Open Visual Studio installer, select
+  - Visual C++ Build Tools (main screen)
+  - In second tab (ensure selected):
+    - Universal CRT
+    - SDK for Windows 10
+    - Cmake
+  
+### Build
+
+```bat
+git clone --recursive https://github.com/erlang/rebar3 rebar3
+cd rebar3
+set PATH=%PATH%;c:\Program Files\erl-24.3.4.6\bin
+bootstrap.bat
+cd ..
+
+git clone https://github.com/microsoft/vcpkg
+cd vcpkg
+bootstrap-vcpkg.bat
+# WIN7 ONLY
+# go download
+# https://github.com/nalexandru/api-ms-win-core-path-HACK/releases
+# https://github.com/nalexandru/api-ms-win-core-path-HACK/releases/download/0.3.1/api-ms-win-core-path-blender-0.3.1.zip
+# unpack
+# copy as api-ms-win-core-path-HACK recommends (admin required)
+# copy x64\api-ms-win-core-path-l1-1-0.dll C:\Windows\System32
+# copy x86\api-ms-win-core-path-l1-1-0.dll C:\Windows\SysWOW64
+# WIN7 ONLY
+vcpkg install zlib:x64-windows
+vcpkg install zlib:x86-windows
+# (as admin)
+copy installed\x64-windows\bin\zlib1.dll C:\Windows\System32
+copy installed\x86-windows\bin\zlib1.dll C:\Windows\SysWOW64
+vcpkg install python3[deprecated-win7-support]
+
+vcpkg install gmp:x64-windows
+vcpkg install openssl:x64-windows
+cd ..
+
+
+git clone --recursive https://github.com/virdpool/arweave.git arweave
+cd arweave
+git checkout win_2.6
+git submodule update
+
+# if needed go arweave/apps/arweave/c_src/CMakeLists.txt
+# patch this line with your path to erlang includes
+# include_directories("c:/Program Files/erl-24.3.4.6/usr/include")
+# Also you need patch vcpkg dir if your installation folder is somewhere else then recommended path before
+# include_directories("../../../../vcpkg/buildtrees/gmp/x64-windows-rel")
+# include_directories("../../../../vcpkg/buildtrees/openssl/x64-windows-rel/include")
+
+# look win_build.bat
+# Ensure ERL, GIT, MSVC_CMAKE, MSVC_TOOLS are correct in win_build.bat (script will autodetect if not exists)
+win_build.bat
+# Ensure ERL is correct in win_dist.bat (script will autodetect if not exists)
+win_dist.bat
+
+```
+
+## Running a node locally
+
+```sh
+$ bin/start-dev
+```
+
 ## Running the tests
 
 ```sh
