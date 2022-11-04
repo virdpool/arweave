@@ -6,6 +6,7 @@ project(arweave)
 
 set(arweave_sources
 ar_mine_randomx.c
+vdf.cpp
 randomx_long_with_entropy.cpp
 feistel_msgsize_key_cipher.cpp)
 

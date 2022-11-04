@@ -3,7 +3,9 @@
 #include "randomx.h"
 
 const int SALT_SIZE = 32;
-const int VDF_SHA_HASH_SIZE = 32;
+// doesn't compile with MSVC
+// const int VDF_SHA_HASH_SIZE = 32;
+#define VDF_SHA_HASH_SIZE  32
 
 #if defined(__cplusplus)
 extern "C" {
