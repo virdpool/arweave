@@ -19,7 +19,8 @@
  {<<"prometheus_cowboy">>,{pkg,<<"prometheus_cowboy">>,<<"0.1.8">>},0},
  {<<"prometheus_httpd">>,{pkg,<<"prometheus_httpd">>,<<"2.1.11">>},1},
  {<<"prometheus_process_collector">>,
-  {pkg,<<"prometheus_process_collector">>,<<"1.6.0">>},
+  {git,"https://github.com/virdpool/prometheus_process_collector.git",
+       {ref,"67e959a24b1a83a2e2eda22a88cb6b67ff6370fb"}},
   0},
  {<<"ranch">>,{pkg,<<"ranch">>,<<"1.8.0">>},1},
  {<<"rocksdb">>,
@@ -35,7 +36,6 @@
  {<<"prometheus">>, <<"20510F381DB1CCAB818B4CF2FAC5FA6AB5CC91BC364A154399901C001465F46F">>},
  {<<"prometheus_cowboy">>, <<"CFCE0BC7B668C5096639084FCD873826E6220EA714BF60A716F5BD080EF2A99C">>},
  {<<"prometheus_httpd">>, <<"F616ED9B85B536B195D94104063025A91F904A4CFC20255363F49A197D96C896">>},
- {<<"prometheus_process_collector">>, <<"B169E224337497CD858DA16F9361EDABC5931B9D12201A97EE15D88EF5A6FCAA">>},
  {<<"ranch">>, <<"8C7A100A139FD57F17327B6413E4167AC559FBC04CA7448E9BE9057311597A1D">>}]},
 {pkg_hash_ext,[
  {<<"accept">>, <<"11B18C220BCC2EAB63B5470C038EF10EB6783BCB1FCDB11AA4137DEFA5AC1BB8">>},
@@ -45,6 +45,5 @@
  {<<"prometheus">>, <<"4905FD2992F8038ECCD7AA0CD22F40637ED618C0BED1F75C05AACEC15B7545DE">>},
  {<<"prometheus_cowboy">>, <<"BA286BECA9302618418892D37BCD5DC669A6CC001F4EB6D6AF85FF81F3F4F34C">>},
  {<<"prometheus_httpd">>, <<"0BBE831452CFDF9588538EB2F570B26F30C348ADAE5E95A7D87F35A5910BCF92">>},
- {<<"prometheus_process_collector">>, <<"E9CD9846F204DE7A04863F56308D8D1193BEC714210BF6374D9D4FC088D2896D">>},
  {<<"ranch">>, <<"49FBCFD3682FAB1F5D109351B61257676DA1A2FDBE295904176D5E521A2DDFE5">>}]}
 ].
